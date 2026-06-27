@@ -1,0 +1,42 @@
+# CI for the orb itself, all on GitHub Actions so every push and PR is gated:
+#   - BATS tests over the vendored setup.sh (the script the orb inlines),
+#   - shellcheck on that script, and
+#   - `circleci orb pack` + `validate` to catch orb-schema errors before publish.
+# Publishing happens on a git tag (see tag_release.yaml).
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  tests:
+    name: ":shell: Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run BATS tests
+        run: docker compose run --rm tests
+
+  shellcheck:
+    name: ":shell: Shellcheck"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run shellcheck
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable \
+            src/scripts/setup.sh
+
+  validate:
+    name: ":circleci: Orb pack & validate"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the CircleCI CLI
+        run: |
+          curl -fLSs https://raw.githubusercontent.com/CircleCI-Public/circleci-cli/main/install.sh | sudo bash
+      - name: Pack and validate the orb
+        run: |
+          circleci orb pack src > orb.yml
+          circleci orb validate orb.yml
