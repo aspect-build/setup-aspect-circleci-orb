@@ -46,7 +46,7 @@ jobs:
       - run: bazel run //hello:world
 ```
 
-`rosetta bazelrc` reads the workspace's `.bazelversion`, so `setup` must run
+The rc generator reads the workspace's `.bazelversion`, so `setup` must run
 **after** `checkout`.
 
 `aspect <task>` jobs don't need the orb (they self-configure).
