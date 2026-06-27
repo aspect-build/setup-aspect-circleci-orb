@@ -55,7 +55,7 @@ The rc generator reads the workspace's `.bazelversion`, so `setup` must run
 
 - An Aspect Workflows CircleCI runner (sets `ASPECT_WORKFLOWS_RUNNER`). On any
   other executor the `setup` command no-ops.
-- A repo with a committed `.bazelversion` (`rosetta bazelrc` resolves the Bazel
+- A repo with a committed `.bazelversion` (the rc generator resolves the Bazel
   version from it and has no fallback).
 - `aspect`, `bazel`, and `rosetta` are provided by the Workflows runner image.
 
