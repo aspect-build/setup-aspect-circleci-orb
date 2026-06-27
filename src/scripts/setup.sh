@@ -31,9 +31,16 @@
 
 set -euo pipefail
 
-# Path of the system bazelrc — the first rc Bazel loads. Overridable for tests
-# (writing the real path requires root, which a test environment lacks).
+# Path of the system bazelrc written by the legacy `rosetta` fallback — the
+# first rc Bazel loads. Overridable for tests (writing the real path requires
+# root, which a test environment lacks).
 SYSTEM_BAZELRC="${ASPECT_WORKFLOWS_PLUGIN_SYSTEM_BAZELRC:-/etc/bazel.bazelrc}"
+
+# Minimum Aspect CLI version that ships `aspect ci bazelrc`. Surfaced in the
+# warning shown when neither the new command nor the legacy `rosetta` can
+# configure raw `bazel` calls.
+# TODO: pin once `aspect ci bazelrc` is released.
+ASPECT_CI_BAZELRC_MIN_VERSION="vX.Y.Z"
 
 # The env var this script exports (and downstream `aspect <task>` steps can read)
 # when it detects it is out of date on the current Workflows runner.
@@ -146,7 +153,21 @@ wait_for_warming() {
   fi
 }
 
-# Generate the system bazelrc via `rosetta bazelrc`.
+# Preferred generator: `aspect ci bazelrc`.
+#
+# Writes ~/.bazelrc (the first user rc Bazel loads) with the runner's remote
+# cache, repository cache, and output flags — the same flags `aspect <task>`
+# injects. It reads the runner's environment, not a Workflows config, so no
+# throwaway config or `.bazelversion` plumbing is needed. Returns the command's
+# exit code; non-zero means the CLI is too old to ship the subcommand (or it
+# genuinely failed), in which case the caller falls back to `rosetta`.
+aspect_ci_bazelrc() {
+  command -v aspect > /dev/null 2>&1 || return 127
+  log "Generating ~/.bazelrc via \`aspect ci bazelrc\`"
+  aspect ci bazelrc
+}
+
+# Legacy fallback generator: `rosetta bazelrc` -> ${SYSTEM_BAZELRC}.
 #
 # `rosetta bazelrc` reads .aspect/workflows/config.yaml by default and fails if
 # that file is absent or unreadable. We only need the generated rc, not a real
@@ -160,9 +181,10 @@ wait_for_warming() {
 # rosetta's stdout (the rc content) is captured to a temp file and only moved
 # into place once rosetta exits 0 — never redirect straight into ${SYSTEM_BAZELRC},
 # which would truncate it before rosetta runs and leave a half-written rc on
-# failure. A rosetta failure fails the job (matching setup-aspect); its own error
-# is left on stderr and we add our exit code on top.
-write_bazelrc() {
+# failure. Its own error is left on stderr and we add our exit code on top.
+rosetta_bazelrc() {
+  command -v rosetta > /dev/null 2>&1 || return 127
+
   if [[ ! -f .bazelversion ]]; then
     warn "No .bazelversion file in $(pwd). \`rosetta bazelrc\` resolves the Bazel version from .bazelversion and has no fallback, so it cannot generate a bazelrc here. Commit a .bazelversion to the repo (the same file Bazelisk reads), or run this setup only where the working directory contains one."
     return 1
@@ -186,6 +208,23 @@ write_bazelrc() {
   log "Wrote Workflows-tuned bazelrc to ${SYSTEM_BAZELRC}"
 }
 
+# Configure raw `bazel` calls: prefer `aspect ci bazelrc`, fall back to the
+# legacy `rosetta bazelrc` on older runners. If neither can run, warn — but do
+# NOT fail the build: warming has already completed and `aspect <task>` steps
+# still work; only raw `bazel` calls go unconfigured.
+write_bazelrc() {
+  if aspect_ci_bazelrc; then
+    return 0
+  fi
+
+  if rosetta_bazelrc; then
+    return 0
+  fi
+
+  mark_deprecated "Could not configure raw \`bazel\` calls on this Workflows runner: \`aspect ci bazelrc\` is unavailable (Aspect CLI ${ASPECT_CI_BAZELRC_MIN_VERSION} or newer is required) and the legacy \`rosetta\` fallback is not on PATH. Warming completed and \`aspect <task>\` steps are unaffected, but raw \`bazel\` calls will not pick up the runner's remote cache, repository cache, or disk cache and so will not function correctly. Upgrade the Aspect CLI on the runner image to ${ASPECT_CI_BAZELRC_MIN_VERSION}+."
+  return 0
+}
+
 main() {
   if [[ -z "${ASPECT_WORKFLOWS_RUNNER:-}" ]]; then
     log "Not an Aspect Workflows runner (ASPECT_WORKFLOWS_RUNNER unset) — skipping Aspect Workflows setup."
@@ -197,20 +236,6 @@ main() {
   log_workflows_runner_metadata
 
   wait_for_warming
-
-  # The runner sets ASPECT_WORKFLOWS_RUNNER_BAZELRC_GENERATE during the transition
-  # window where a newer bazelrc-generation mechanism is available alongside the
-  # legacy `rosetta` binary. Warn early — `rosetta` is guaranteed to be removed in
-  # a future major Aspect Workflows release, at which point this setup will stop
-  # configuring the environment for raw `bazel` calls.
-  if [[ -n "${ASPECT_WORKFLOWS_RUNNER_BAZELRC_GENERATE:-}" ]]; then
-    mark_deprecated "This version of the Aspect Workflows CI integration is out of date. The Aspect Workflows runner is signaling that a newer mechanism for configuring the Bazel environment is available (ASPECT_WORKFLOWS_RUNNER_BAZELRC_GENERATE is set). It will continue to work in this Aspect Workflows version via the legacy \`rosetta\` fallback, but will stop configuring raw \`bazel\` calls after the next major Aspect Workflows release removes \`rosetta\`. Upgrade to the latest release."
-  fi
-
-  if ! command -v rosetta > /dev/null 2>&1; then
-    mark_deprecated "\`rosetta\` is not on PATH on this Workflows runner. The Aspect Workflows CI integration expected to call \`rosetta bazelrc > ${SYSTEM_BAZELRC}\` to populate the Workflows-tuned Bazel rc. Upgrade to the latest release to pick up the replacement mechanism."
-    return 0
-  fi
 
   write_bazelrc
 }

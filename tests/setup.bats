@@ -4,18 +4,20 @@
 # run via the buildkite/plugin-tester image (`docker-compose run --rm tests`).
 # Drives the script through its branches with ASPECT_WORKFLOWS_RUNNER_* env vars.
 #
-# `rosetta` is stubbed with a hand-rolled script placed on PATH rather than via
-# bats-mock's `stub`: bats-mock derives an env-var prefix from the uppercased
-# command name (ROSETTA_STUB_RUN, …), which Apple's Rosetta 2 runtime intercepts
-# and aborts when the suite runs under Docker Desktop on Apple Silicon. A PATH
-# stub is portable across both real Linux CI agents and Apple Silicon dev hosts.
+# `aspect` and `rosetta` are stubbed with hand-rolled scripts placed on PATH
+# rather than via bats-mock's `stub`: bats-mock derives an env-var prefix from
+# the uppercased command name (ROSETTA_STUB_RUN, …), which Apple's Rosetta 2
+# runtime intercepts and aborts when the suite runs under Docker Desktop on
+# Apple Silicon. A PATH stub is portable across both real Linux CI agents and
+# Apple Silicon dev hosts.
 
 setup() {
   load "${BATS_PLUGIN_PATH}/load.bash"
 
   HOOK="${PWD}/src/scripts/setup.sh"
 
-  # Redirect the system bazelrc write to a temp file so tests don't need root.
+  # Redirect the legacy-rosetta system bazelrc write to a temp file so tests
+  # don't need root.
   BAZELRC_OUT="$(mktemp)"
   export ASPECT_WORKFLOWS_PLUGIN_SYSTEM_BAZELRC="${BAZELRC_OUT}"
 
@@ -27,19 +29,50 @@ setup() {
   STUB_BIN="$(mktemp -d)"
 
   # A fake checked-out workspace, with a .bazelversion, that the hook runs in:
-  # the pre-command hook reads .bazelversion from CWD. Tests cd here before
+  # the rosetta fallback reads .bazelversion from CWD. Tests cd here before
   # invoking the hook (the missing-.bazelversion test omits the file).
   WORKSPACE_DIR="$(mktemp -d)"
   echo "9.0.0" > "${WORKSPACE_DIR}/.bazelversion"
+
+  # Marker file written by the `aspect` stub so a test can prove it ran.
+  ASPECT_STUB_RAN="$(mktemp -u)"
 }
 
 teardown() {
-  rm -rf "${BAZELRC_OUT}" "${BUILDKITE_ENV_FILE}" "${STUB_BIN}" "${WORKSPACE_DIR}"
+  rm -rf "${BAZELRC_OUT}" "${BUILDKITE_ENV_FILE}" "${STUB_BIN}" "${WORKSPACE_DIR}" "${ASPECT_STUB_RAN}"
 }
 
 # Run the hook from inside the fake workspace (CWD with a .bazelversion).
 run_hook() {
   run bash -c "cd '${WORKSPACE_DIR}' && '${HOOK}'"
+}
+
+# Put an `aspect` on PATH whose `ci bazelrc` subcommand succeeds and records that
+# it ran. Any other invocation (e.g. a real task) is a no-op success.
+stub_aspect() {
+  cat > "${STUB_BIN}/aspect" <<EOF
+#!/bin/bash
+if [[ "\$1" == "ci" && "\$2" == "bazelrc" ]]; then
+  echo "aspect: wrote ~/.bazelrc"
+  touch '${ASPECT_STUB_RAN}'
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "${STUB_BIN}/aspect"
+  export PATH="${STUB_BIN}:${PATH}"
+}
+
+# Put an `aspect` on PATH that fails `ci bazelrc` (e.g. a CLI too old to ship the
+# subcommand — clap exits 2 on an unknown subcommand).
+stub_old_aspect() {
+  cat > "${STUB_BIN}/aspect" <<'EOF'
+#!/bin/bash
+echo "error: unrecognized subcommand 'ci'" >&2
+exit 2
+EOF
+  chmod +x "${STUB_BIN}/aspect"
+  export PATH="${STUB_BIN}:${PATH}"
 }
 
 # Put a `rosetta` on PATH whose `bazelrc` subcommand prints $1 (default rc text).
@@ -74,12 +107,13 @@ EOF
   refute_output --partial "Detected Aspect Workflows runner"
 }
 
-@test "logs metadata, writes bazelrc via rosetta on a Workflows runner" {
+@test "prefers \`aspect ci bazelrc\` to generate ~/.bazelrc" {
   export ASPECT_WORKFLOWS_RUNNER=1
   export ASPECT_WORKFLOWS_RUNNER_VERSION="2026.22.39"
   export ASPECT_WORKFLOWS_RUNNER_CLOUD_PROVIDER="aws"
   export ASPECT_WORKFLOWS_RUNNER_HAS_NVME_STORAGE=1
-  stub_rosetta "build --remote_cache=grpcs://example"
+  stub_aspect
+  stub_rosetta  # present but should NOT be used — aspect wins.
 
   run_hook
 
@@ -88,16 +122,43 @@ EOF
   assert_output --partial "Workflows version: 2026.22.39"
   assert_output --partial "Cloud provider: AWS"
   assert_output --partial "NVMe storage: yes"
+  assert_output --partial "aspect ci bazelrc"
+
+  # The aspect stub ran; the rosetta fallback's system rc was never written.
+  [ -f "${ASPECT_STUB_RAN}" ]
+  refute_output --partial "Wrote Workflows-tuned bazelrc"
+}
+
+@test "falls back to \`rosetta bazelrc\` when aspect is too old" {
+  export ASPECT_WORKFLOWS_RUNNER=1
+  stub_old_aspect
+  stub_rosetta "build --remote_cache=grpcs://example"
+
+  run_hook
+
+  assert_success
   assert_output --partial "Wrote Workflows-tuned bazelrc to ${BAZELRC_OUT}"
 
   run cat "${BAZELRC_OUT}"
   assert_output --partial "build --remote_cache=grpcs://example"
 }
 
+@test "falls back to rosetta when aspect is absent" {
+  export ASPECT_WORKFLOWS_RUNNER=1
+  # No aspect on PATH; rosetta present.
+  export PATH="${STUB_BIN}:/usr/bin:/bin"
+  stub_rosetta
+
+  run_hook
+
+  assert_success
+  assert_output --partial "Wrote Workflows-tuned bazelrc to ${BAZELRC_OUT}"
+}
+
 @test "omits unset metadata rows" {
   export ASPECT_WORKFLOWS_RUNNER=1
   export ASPECT_WORKFLOWS_RUNNER_VERSION="2026.22.39"
-  stub_rosetta
+  stub_aspect
 
   run_hook
 
@@ -113,7 +174,7 @@ EOF
   local marker
   marker="$(mktemp -u)"
   export ASPECT_WORKFLOWS_RUNNER_WARMING_COMPLETE_MARKER_FILE="${marker}"
-  stub_rosetta
+  stub_aspect
 
   # Create the marker shortly after the hook starts polling.
   ( sleep 2; touch "${marker}" ) &
@@ -133,7 +194,7 @@ EOF
   local marker
   marker="$(mktemp)"
   export ASPECT_WORKFLOWS_RUNNER_WARMING_COMPLETE_MARKER_FILE="${marker}"
-  stub_rosetta
+  stub_aspect
 
   run_hook
 
@@ -152,7 +213,7 @@ EOF
   echo "cache-v123" > "${version_file}"
   export ASPECT_WORKFLOWS_RUNNER_WARMING_COMPLETE_MARKER_FILE="${marker}"
   export ASPECT_WORKFLOWS_RUNNER_WARMING_CACHE_VERSION_FILE="${version_file}"
-  stub_rosetta
+  stub_aspect
 
   run_hook
 
@@ -165,7 +226,7 @@ EOF
 @test "warns when warming enabled but marker var unset" {
   export ASPECT_WORKFLOWS_RUNNER=1
   export ASPECT_WORKFLOWS_RUNNER_WARMING_ENABLED=1
-  stub_rosetta
+  stub_aspect
 
   run_hook
 
@@ -173,50 +234,39 @@ EOF
   assert_output --partial "ASPECT_WORKFLOWS_RUNNER_WARMING_COMPLETE_MARKER_FILE is not set"
 }
 
-@test "marks deprecated and skips bazelrc when rosetta is absent" {
+@test "warns about min CLI version (without failing) when neither aspect nor rosetta can configure bazel" {
   export ASPECT_WORKFLOWS_RUNNER=1
-  # Do not stub rosetta — `command -v rosetta` should miss. Restrict PATH so a
-  # real rosetta (if any) on the runner can't satisfy the lookup.
+  # Neither aspect nor rosetta on PATH. Restrict PATH so a real one (if any) on
+  # the runner can't satisfy the lookup.
   export PATH="${STUB_BIN}:/usr/bin:/bin"
 
   run_hook
 
+  # Build is NOT failed: warming is done and `aspect <task>` steps still work.
   assert_success
-  assert_output --partial "\`rosetta\` is not on PATH"
+  assert_output --partial "Could not configure raw"
+  assert_output --partial "Aspect CLI"
   refute_output --partial "Wrote Workflows-tuned bazelrc"
 
   run cat "${BUILDKITE_ENV_FILE}"
   assert_output --partial "ASPECT_WORKFLOWS_PLUGIN_DEPRECATED=1"
 }
 
-@test "marks deprecated when the runner signals a newer mechanism" {
-  export ASPECT_WORKFLOWS_RUNNER=1
-  export ASPECT_WORKFLOWS_RUNNER_BAZELRC_GENERATE=1
-  stub_rosetta
-
-  run_hook
-
-  assert_success
-  assert_output --partial "is out of date"
-  # Still falls back to rosetta in this version.
-  assert_output --partial "Wrote Workflows-tuned bazelrc"
-
-  run cat "${BUILDKITE_ENV_FILE}"
-  assert_output --partial "ASPECT_WORKFLOWS_PLUGIN_DEPRECATED=1"
-}
-
-@test "fails the build (and leaves the system rc untouched) when rosetta errors" {
+@test "does not fail the build when the rosetta fallback errors" {
   export ASPECT_WORKFLOWS_RUNNER=1
   # Pre-existing system rc that must NOT be clobbered by a failed run.
   echo "build --pre-existing" > "${BAZELRC_OUT}"
+  # No aspect; rosetta present but failing.
+  export PATH="${STUB_BIN}:/usr/bin:/bin"
   stub_failing_rosetta
 
   run_hook
 
-  assert_failure 200
+  # rosetta's failure degrades to the min-version warning, not a build failure.
+  assert_success
   assert_output --partial "rosetta bazelrc\` failed (exit 200)"
-  # rosetta's own stderr is surfaced, not swallowed.
   assert_output --partial "Unexpected error when generating bazelrc content"
+  assert_output --partial "Could not configure raw"
   refute_output --partial "Wrote Workflows-tuned bazelrc"
 
   # The existing system rc is untouched (not truncated to empty).
@@ -224,20 +274,22 @@ EOF
   assert_output "build --pre-existing"
 }
 
-@test "fails with an actionable message when the workspace has no .bazelversion" {
+@test "does not fail when rosetta fallback hits a workspace with no .bazelversion" {
   export ASPECT_WORKFLOWS_RUNNER=1
-  # Pre-existing system rc that must NOT be clobbered.
   echo "build --pre-existing" > "${BAZELRC_OUT}"
-  stub_rosetta  # rosetta is present; the guard should fire before calling it.
+  # No aspect; rosetta present, but the workspace lacks .bazelversion.
+  export PATH="${STUB_BIN}:/usr/bin:/bin"
+  stub_rosetta
   rm -f "${WORKSPACE_DIR}/.bazelversion"
 
   run_hook
 
-  assert_failure
+  assert_success
   assert_output --partial "No .bazelversion file"
+  assert_output --partial "Could not configure raw"
   refute_output --partial "Wrote Workflows-tuned bazelrc"
 
-  # rosetta was never invoked, and the existing system rc is untouched.
+  # rosetta was never invoked past the guard; the existing system rc is untouched.
   run cat "${BAZELRC_OUT}"
   assert_output "build --pre-existing"
 }
