@@ -1,0 +1,102 @@
+# Tag a release, publish the orb to the CircleCI registry, and publish GitHub
+# Release notes — run manually from the Actions tab when you want to cut a
+# release. The deliberate, human-triggered counterpart to the automatic
+# weekly_tag.yaml; doing it in CI avoids error-prone local git state.
+#
+# The release tag is `vYYYY.VV.N` — this week's weekly tag (bare `YYYY.VV`) plus
+# the commits since it (see release_version.sh), with a leading `v` to match the
+# Aspect CLI's release tags. Weekly tags stay bare so the describe-match in
+# release_version.sh keeps working; only release tags get the `v`.
+#
+# The bare `YYYY.VV.N` (no `v`) doubles as the orb's semver version on the
+# CircleCI registry — `2026.25.0` is valid semver — so the published orb is
+# `aspect-build/setup-aspect@YYYY.VV.N`. Consumers should still pin to the
+# orb's resolved commit/version per the README; the registry version is the
+# discoverable handle.
+#
+# Requires a CircleCI personal API token with publish rights to the
+# `aspect-build` namespace, stored as the `CIRCLECI_TOKEN` repo secret.
+name: Tag a Release
+on:
+  workflow_dispatch:
+permissions:
+  contents: write # create the tag and the release
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # need full tag history to derive YYYY.VV.N
+      - id: version
+        name: Compute release version
+        run: |
+          set -euo pipefail
+          chmod +x .github/workflows/*.sh
+          # release_version.sh emits the bare `YYYY.VV.N`; the release tag adds
+          # `v`, the orb version is the bare form.
+          bare="$(.github/workflows/release_version.sh)"
+          tag="v${bare}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::error::Tag ${tag} already exists (nothing new to release since the last release at this commit). Orb versions are immutable; land a new commit before releasing again."
+            exit 1
+          fi
+          echo "bare=${bare}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${tag} (orb version ${bare}) at ${GITHUB_SHA}"
+      # Create and push the tag ourselves, BEFORE the irreversible orb publish, so
+      # the version guard above reliably blocks re-runs on an already-released
+      # commit (a draft GitHub release does not create the underlying tag, which
+      # is how an earlier re-run slipped past the guard into a duplicate publish).
+      - name: Create and push the git tag
+        run: |
+          set -euo pipefail
+          git tag "${{ steps.version.outputs.tag }}" "${GITHUB_SHA}"
+          git push origin "${{ steps.version.outputs.tag }}"
+      - name: Install the CircleCI CLI
+        run: |
+          curl -fLSs https://raw.githubusercontent.com/CircleCI-Public/circleci-cli/main/install.sh | sudo bash
+      - name: Pack, validate, and publish the orb
+        env:
+          CIRCLECI_CLI_TOKEN: ${{ secrets.CIRCLECI_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CIRCLECI_CLI_TOKEN}" ]]; then
+            echo "::error::CIRCLECI_TOKEN repo secret is not set. Create a CircleCI personal API token with publish rights to the aspect-build namespace (https://app.circleci.com/settings/user/tokens) and add it as the CIRCLECI_TOKEN secret on this repo."
+            exit 1
+          fi
+          circleci orb pack src > orb.yml
+          circleci orb validate orb.yml
+          # First publish requires the orb to exist in the registry. `orb create`
+          # is a one-time op; ignore the error if it already exists so reruns and
+          # later releases are idempotent.
+          circleci orb create aspect-build/setup-aspect \
+            --no-prompt --token "${CIRCLECI_CLI_TOKEN}" || true
+          version="${{ steps.version.outputs.bare }}"
+          # Orb versions are immutable — you cannot republish an existing one. If
+          # this version is already on the registry (e.g. a re-run after deleting
+          # the git tag), skip the publish and proceed so the tag + GitHub release
+          # are still (re)created.
+          if circleci orb source "aspect-build/setup-aspect@${version}" \
+               --token "${CIRCLECI_CLI_TOKEN}" > /dev/null 2>&1; then
+            echo "Orb aspect-build/setup-aspect@${version} is already published — skipping publish."
+          else
+            circleci orb publish orb.yml \
+              "aspect-build/setup-aspect@${version}" \
+              --token "${CIRCLECI_CLI_TOKEN}"
+          fi
+      - name: Write release notes
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ORB_VERSION: ${{ steps.version.outputs.bare }}
+        run: .github/workflows/release_notes.sh > release_notes.md
+      # The tag already exists (created above), so this attaches a published
+      # (non-draft) GitHub release to it rather than creating a draft.
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          body_path: release_notes.md
+          generate_release_notes: true # append the auto changelog below our body
