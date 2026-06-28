@@ -38,7 +38,7 @@ SYSTEM_BAZELRC="${ASPECT_WORKFLOWS_PLUGIN_SYSTEM_BAZELRC:-/etc/bazel.bazelrc}"
 
 # Minimum Aspect CLI version that ships `aspect ci bazelrc`, and where to get it.
 # Shown when the runner's CLI is too old.
-ASPECT_CI_BAZELRC_MIN_VERSION="v2026.26.37"
+ASPECT_CI_BAZELRC_MIN_VERSION="v2026.26.38"
 ASPECT_CLI_RELEASES_URL="https://github.com/aspect-build/aspect-cli/releases"
 
 # Path `aspect ci bazelrc` writes to (its default, the first user rc Bazel loads).
