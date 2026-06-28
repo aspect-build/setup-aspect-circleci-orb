@@ -149,7 +149,7 @@ EOF
 
   assert_success
   # The ci-command failure points users at the aspect-cli releases.
-  assert_output --partial "aspect-cli v2026.26.42 or newer"
+  assert_output --partial "aspect-cli v2026.26.44 or newer"
   assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
   # Then the rosetta fallback writes the system rc and echoes its contents.
   assert_output --partial "Wrote Workflows-tuned bazelrc to ${BAZELRC_OUT}"
@@ -258,7 +258,7 @@ EOF
   # Build is NOT failed: warming is done and `aspect <task>` steps still work.
   assert_success
   assert_output --partial "Could not configure vanilla"
-  assert_output --partial "v2026.26.42 or newer"
+  assert_output --partial "v2026.26.44 or newer"
   assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
   refute_output --partial "Wrote Workflows-tuned bazelrc"
 }
