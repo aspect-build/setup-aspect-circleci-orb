@@ -36,8 +36,9 @@ set -euo pipefail
 # root, which a test environment lacks).
 SYSTEM_BAZELRC="${ASPECT_WORKFLOWS_PLUGIN_SYSTEM_BAZELRC:-/etc/bazel.bazelrc}"
 
-# URL shown when `aspect ci bazelrc` is unavailable, pointing users at where to
-# get a newer Aspect CLI that ships the `ci` command group.
+# Minimum Aspect CLI version that ships `aspect ci bazelrc`, and where to get it.
+# Shown when the runner's CLI is too old.
+ASPECT_CI_BAZELRC_MIN_VERSION="v2026.26.37"
 ASPECT_CLI_RELEASES_URL="https://github.com/aspect-build/aspect-cli/releases"
 
 # Path `aspect ci bazelrc` writes to (its default, the first user rc Bazel loads).
@@ -178,7 +179,7 @@ aspect_ci_bazelrc() {
   local status=0
   aspect ci bazelrc || status=$?
   if [[ "${status}" -ne 0 ]]; then
-    warn "\`aspect ci bazelrc\` is unavailable in this Aspect CLI (exit ${status}). Upgrade to the latest aspect-cli to pick up the \`ci\` command: ${ASPECT_CLI_RELEASES_URL}. Falling back to \`rosetta bazelrc\`."
+    warn "\`aspect ci bazelrc\` is unavailable in this Aspect CLI (exit ${status}); it requires aspect-cli ${ASPECT_CI_BAZELRC_MIN_VERSION} or newer (${ASPECT_CLI_RELEASES_URL}). Falling back to \`rosetta bazelrc\`."
     return "${status}"
   fi
   log "Wrote Workflows-tuned bazelrc to ${USER_BAZELRC}"
@@ -240,7 +241,7 @@ write_bazelrc() {
     return 0
   fi
 
-  mark_deprecated "Could not configure raw \`bazel\` calls on this Workflows runner: \`aspect ci bazelrc\` is unavailable and the legacy \`rosetta\` fallback is not on PATH. Warming completed and \`aspect <task>\` steps are unaffected, but raw \`bazel\` calls will not pick up the runner's remote cache, repository cache, or disk cache and so will not function correctly. Upgrade to the latest aspect-cli to pick up the \`ci\` command: ${ASPECT_CLI_RELEASES_URL}."
+  mark_deprecated "Could not configure vanilla \`bazel\` calls on this Workflows runner: \`aspect ci bazelrc\` is unavailable and the legacy \`rosetta\` fallback is not on PATH. Warming completed and \`aspect <task>\` steps are unaffected, but vanilla \`bazel\` calls will not pick up the runner's remote cache, repository cache, or disk cache and so will not function correctly. Upgrade aspect-cli to ${ASPECT_CI_BAZELRC_MIN_VERSION} or newer for \`aspect ci bazelrc\` (${ASPECT_CLI_RELEASES_URL})."
   return 0
 }
 
