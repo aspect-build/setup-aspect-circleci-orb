@@ -21,10 +21,6 @@ setup() {
   BAZELRC_OUT="$(mktemp)"
   export ASPECT_WORKFLOWS_PLUGIN_SYSTEM_BAZELRC="${BAZELRC_OUT}"
 
-  # Isolate cross-step env propagation to a temp file.
-  BUILDKITE_ENV_FILE="$(mktemp)"
-  export BUILDKITE_ENV_FILE
-
   # A bin dir we prepend to PATH for hand-rolled stubs.
   STUB_BIN="$(mktemp -d)"
 
@@ -44,7 +40,7 @@ setup() {
 }
 
 teardown() {
-  rm -rf "${BAZELRC_OUT}" "${BUILDKITE_ENV_FILE}" "${STUB_BIN}" "${WORKSPACE_DIR}" "${FAKE_HOME}" "${ASPECT_STUB_RAN}"
+  rm -rf "${BAZELRC_OUT}" "${STUB_BIN}" "${WORKSPACE_DIR}" "${FAKE_HOME}" "${ASPECT_STUB_RAN}"
 }
 
 # Run the hook from inside the fake workspace (CWD with a .bazelversion).
@@ -260,9 +256,6 @@ EOF
   assert_output --partial "v2026.26.37 or newer"
   assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
   refute_output --partial "Wrote Workflows-tuned bazelrc"
-
-  run cat "${BUILDKITE_ENV_FILE}"
-  assert_output --partial "ASPECT_WORKFLOWS_PLUGIN_DEPRECATED=1"
 }
 
 @test "does not fail the build when the rosetta fallback errors" {

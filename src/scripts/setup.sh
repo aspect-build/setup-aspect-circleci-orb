@@ -44,38 +44,12 @@ ASPECT_CLI_RELEASES_URL="https://github.com/aspect-build/aspect-cli/releases"
 # Path `aspect ci bazelrc` writes to (its default, the first user rc Bazel loads).
 USER_BAZELRC="${HOME}/.bazelrc"
 
-# The env var this script exports (and downstream `aspect <task>` steps can read)
-# when it detects it is out of date on the current Workflows runner.
-readonly DEPRECATED_ENV_VAR="ASPECT_WORKFLOWS_PLUGIN_DEPRECATED"
-
 log() {
   echo "$@"
 }
 
 warn() {
   echo "⚠️  $*" >&2
-}
-
-# Export NAME=VALUE for the current process and, where the CI provider gives us a
-# per-job env file, append it there so the value propagates to later steps in the
-# same job. Honors $BUILDKITE_ENV_FILE (Buildkite) and $BASH_ENV (CircleCI);
-# GitLab shares one shell across before_script/script, so the plain export
-# suffices. Analogue of GitHub Actions' core.exportVariable / $GITHUB_ENV.
-export_env() {
-  local name="$1" value="$2"
-  export "${name}=${value}"
-  if [[ -n "${BUILDKITE_ENV_FILE:-}" ]]; then
-    echo "${name}=${value}" >> "${BUILDKITE_ENV_FILE}"
-  elif [[ -n "${BASH_ENV:-}" ]]; then
-    echo "export ${name}=${value}" >> "${BASH_ENV}"
-  fi
-}
-
-# Emit a deprecation warning and export DEPRECATED_ENV_VAR=1 so downstream
-# `aspect <task>` invocations can surface the same signal.
-mark_deprecated() {
-  warn "$1"
-  export_env "${DEPRECATED_ENV_VAR}" "1"
 }
 
 # Render the `1`/unset boolean runner flags as yes/no, matching the Aspect CLI's
@@ -241,7 +215,7 @@ write_bazelrc() {
     return 0
   fi
 
-  mark_deprecated "Could not configure vanilla \`bazel\` calls on this Workflows runner: \`aspect ci bazelrc\` is unavailable and the legacy \`rosetta\` fallback is not on PATH. Warming completed and \`aspect <task>\` steps are unaffected, but vanilla \`bazel\` calls will not pick up the runner's remote cache, repository cache, or disk cache and so will not function correctly. Upgrade aspect-cli to ${ASPECT_CI_BAZELRC_MIN_VERSION} or newer for \`aspect ci bazelrc\` (${ASPECT_CLI_RELEASES_URL})."
+  warn "Could not configure vanilla \`bazel\` calls on this Workflows runner: \`aspect ci bazelrc\` is unavailable and the legacy \`rosetta\` fallback is not on PATH. Warming completed and \`aspect <task>\` steps are unaffected, but vanilla \`bazel\` calls will not pick up the runner's remote cache, repository cache, or disk cache and so will not function correctly. Upgrade aspect-cli to ${ASPECT_CI_BAZELRC_MIN_VERSION} or newer for \`aspect ci bazelrc\` (${ASPECT_CLI_RELEASES_URL})."
   return 0
 }
 
