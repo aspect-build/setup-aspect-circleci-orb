@@ -10,7 +10,7 @@
 #   1. Guard on ASPECT_WORKFLOWS_RUNNER; no-op gracefully when unset.
 #   2. Log the runner's metadata (the ASPECT_WORKFLOWS_RUNNER_* table).
 #   3. Wait for the runner's cache warming to complete — `aspect <task>` does
-#      this itself, but a raw `bazel` call would otherwise race the still-running
+#      this itself, but a vanilla `bazel` call would otherwise race the still-running
 #      bootstrap warming (competing for CPU/disk, missing the warmed caches).
 #   4. Pre-flight the .bazelversion check: `rosetta bazelrc` resolves the Bazel
 #      version from .bazelversion with no fallback, so a missing file is fatal.
@@ -22,7 +22,7 @@
 #      a newer bazelrc-generation mechanism.
 #
 # It must run AFTER the repository checkout (so .bazelversion / the workspace
-# exist, with CWD at the workspace root) and BEFORE the first raw `bazel` call.
+# exist, with CWD at the workspace root) and BEFORE the first vanilla `bazel` call.
 #
 # Ported from aspect-build/setup-aspect's setupOnWorkflowsRunner. Each provider
 # integration vendors a copy of this file and invokes it from its own
@@ -227,10 +227,10 @@ rosetta_bazelrc() {
   print_bazelrc "${SYSTEM_BAZELRC}"
 }
 
-# Configure raw `bazel` calls: prefer `aspect ci bazelrc`, fall back to the
+# Configure vanilla `bazel` calls: prefer `aspect ci bazelrc`, fall back to the
 # legacy `rosetta bazelrc` on older runners. If neither can run, warn — but do
 # NOT fail the build: warming has already completed and `aspect <task>` steps
-# still work; only raw `bazel` calls go unconfigured.
+# still work; only vanilla `bazel` calls go unconfigured.
 write_bazelrc() {
   if aspect_ci_bazelrc; then
     return 0

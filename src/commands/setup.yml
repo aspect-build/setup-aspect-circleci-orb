@@ -1,10 +1,10 @@
 description: >
-  Configure the Aspect Workflows runner for raw `bazel` calls: wait for cache
-  warming to complete and write the Workflows-tuned /etc/bazel.bazelrc via
-  `rosetta bazelrc`.
+  Configure the Aspect Workflows runner for vanilla `bazel` calls: wait for cache
+  warming to complete and generate a Workflows-tuned Bazel rc (via
+  `aspect ci bazelrc`, falling back to `rosetta bazelrc` on older runners).
 
   Add this as a step after `checkout` and before any step that calls `bazel`
-  directly. `rosetta bazelrc` reads the workspace's `.bazelversion`, so the repo
+  directly. The rc generator reads the workspace's `.bazelversion`, so the repo
   must already be checked out (CWD = the workspace root). On a non-Workflows
   runner the command no-ops gracefully.
 

@@ -1,7 +1,7 @@
 version: 2.1
 
 description: >
-  Prepares an Aspect Workflows CI runner so that raw `bazel` calls — not just
+  Prepares an Aspect Workflows CI runner so that vanilla `bazel` calls — not just
   `aspect <task>` — route through the runner's caching infrastructure. The
   `setup` command waits for the runner's cache warming to complete and generates
   a Bazel rc via `aspect ci bazelrc` (falling back to the runner-provided
