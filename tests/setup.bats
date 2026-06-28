@@ -34,12 +34,17 @@ setup() {
   WORKSPACE_DIR="$(mktemp -d)"
   echo "9.0.0" > "${WORKSPACE_DIR}/.bazelversion"
 
+  # Sandbox HOME so the `aspect ci bazelrc` path (writes ~/.bazelrc) and the
+  # plugin's rc dump don't touch the real user's ~/.bazelrc.
+  FAKE_HOME="$(mktemp -d)"
+  export HOME="${FAKE_HOME}"
+
   # Marker file written by the `aspect` stub so a test can prove it ran.
   ASPECT_STUB_RAN="$(mktemp -u)"
 }
 
 teardown() {
-  rm -rf "${BAZELRC_OUT}" "${BUILDKITE_ENV_FILE}" "${STUB_BIN}" "${WORKSPACE_DIR}" "${ASPECT_STUB_RAN}"
+  rm -rf "${BAZELRC_OUT}" "${BUILDKITE_ENV_FILE}" "${STUB_BIN}" "${WORKSPACE_DIR}" "${FAKE_HOME}" "${ASPECT_STUB_RAN}"
 }
 
 # Run the hook from inside the fake workspace (CWD with a .bazelversion).
@@ -47,13 +52,14 @@ run_hook() {
   run bash -c "cd '${WORKSPACE_DIR}' && '${HOOK}'"
 }
 
-# Put an `aspect` on PATH whose `ci bazelrc` subcommand succeeds and records that
-# it ran. Any other invocation (e.g. a real task) is a no-op success.
+# Put an `aspect` on PATH whose `ci bazelrc` subcommand succeeds: it writes a
+# stub rc to $HOME/.bazelrc (where the real command's default `--output` points)
+# and records that it ran. Any other invocation (e.g. a real task) is a no-op.
 stub_aspect() {
   cat > "${STUB_BIN}/aspect" <<EOF
 #!/bin/bash
 if [[ "\$1" == "ci" && "\$2" == "bazelrc" ]]; then
-  echo "aspect: wrote ~/.bazelrc"
+  echo 'common --remote_cache=grpcs://example' > "\${HOME}/.bazelrc"
   touch '${ASPECT_STUB_RAN}'
   exit 0
 fi
@@ -124,12 +130,16 @@ EOF
   assert_output --partial "NVMe storage: yes"
   assert_output --partial "aspect ci bazelrc"
 
-  # The aspect stub ran; the rosetta fallback's system rc was never written.
+  # The aspect stub ran and wrote ~/.bazelrc; its contents are echoed to the log.
   [ -f "${ASPECT_STUB_RAN}" ]
-  refute_output --partial "Wrote Workflows-tuned bazelrc"
+  assert_output --partial "Wrote Workflows-tuned bazelrc to ${HOME}/.bazelrc"
+  assert_output --partial "common --remote_cache=grpcs://example"
+
+  # The rosetta fallback's system rc was never written.
+  refute_output --partial "${BAZELRC_OUT}"
 }
 
-@test "falls back to \`rosetta bazelrc\` when aspect is too old" {
+@test "falls back to \`rosetta bazelrc\` when aspect is too old, with an upgrade hint" {
   export ASPECT_WORKFLOWS_RUNNER=1
   stub_old_aspect
   stub_rosetta "build --remote_cache=grpcs://example"
@@ -137,9 +147,11 @@ EOF
   run_hook
 
   assert_success
+  # The ci-command failure points users at the aspect-cli releases.
+  assert_output --partial "Upgrade to the latest aspect-cli"
+  assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
+  # Then the rosetta fallback writes the system rc and echoes its contents.
   assert_output --partial "Wrote Workflows-tuned bazelrc to ${BAZELRC_OUT}"
-
-  run cat "${BAZELRC_OUT}"
   assert_output --partial "build --remote_cache=grpcs://example"
 }
 
@@ -234,7 +246,7 @@ EOF
   assert_output --partial "ASPECT_WORKFLOWS_RUNNER_WARMING_COMPLETE_MARKER_FILE is not set"
 }
 
-@test "warns about min CLI version (without failing) when neither aspect nor rosetta can configure bazel" {
+@test "warns with an aspect-cli upgrade hint (without failing) when neither aspect nor rosetta can configure bazel" {
   export ASPECT_WORKFLOWS_RUNNER=1
   # Neither aspect nor rosetta on PATH. Restrict PATH so a real one (if any) on
   # the runner can't satisfy the lookup.
@@ -245,7 +257,8 @@ EOF
   # Build is NOT failed: warming is done and `aspect <task>` steps still work.
   assert_success
   assert_output --partial "Could not configure raw"
-  assert_output --partial "Aspect CLI"
+  assert_output --partial "Upgrade to the latest aspect-cli"
+  assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
   refute_output --partial "Wrote Workflows-tuned bazelrc"
 
   run cat "${BUILDKITE_ENV_FILE}"

@@ -10,5 +10,5 @@ description: >
 
 steps:
   - run:
-      name: "Aspect Workflows: configure bazel"
+      name: "Setup Aspect"
       command: <<include(scripts/setup.sh)>>
