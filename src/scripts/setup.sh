@@ -135,8 +135,15 @@ print_bazelrc() {
   local path="$1"
   [[ -f "${path}" ]] || return 0
   log "Generated ${path}:"
-  # Indent so it reads as a quoted block, not as live log directives.
-  sed 's/^/  /' "${path}"
+  # Redact header-flag values (gRPC/HTTP headers carry credentials and the
+  # runner's x-identity) so the echoed rc doesn't leak them, keeping the flag
+  # and header name visible: `--remote_header=x-identity=<uuid>` becomes
+  # `--remote_header=x-identity=<REDACTED>`. Then indent so it reads as a quoted
+  # block, not as live log directives.
+  sed -E \
+    -e 's/(--(remote_header|remote_cache_header|remote_exec_header|remote_downloader_header|bes_header)=[^=[:space:]]+=).*/\1<REDACTED>/' \
+    -e 's/^/  /' \
+    "${path}"
 }
 
 # Preferred generator: `aspect ci bazelrc`.

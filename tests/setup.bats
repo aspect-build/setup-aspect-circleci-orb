@@ -55,7 +55,10 @@ stub_aspect() {
   cat > "${STUB_BIN}/aspect" <<EOF
 #!/bin/bash
 if [[ "\$1" == "ci" && "\$2" == "bazelrc" ]]; then
-  echo 'common --remote_cache=grpcs://example' > "\${HOME}/.bazelrc"
+  {
+    echo 'common --remote_cache=grpcs://example'
+    echo 'common --remote_header=x-identity=00000000-0000-0000-0000-000000000000'
+  } > "\${HOME}/.bazelrc"
   touch '${ASPECT_STUB_RAN}'
   exit 0
 fi
@@ -130,6 +133,8 @@ EOF
   [ -f "${ASPECT_STUB_RAN}" ]
   assert_output --partial "Wrote Workflows-tuned bazelrc to ${HOME}/.bazelrc"
   assert_output --partial "common --remote_cache=grpcs://example"
+  assert_output --partial "common --remote_header=x-identity=<REDACTED>"
+  refute_output --partial "x-identity=00000000-0000-0000-0000-000000000000"
 
   # The rosetta fallback's system rc was never written.
   refute_output --partial "${BAZELRC_OUT}"
