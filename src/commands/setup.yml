@@ -1,7 +1,8 @@
 description: >
   Configure the Aspect Workflows runner for vanilla `bazel` calls: wait for cache
   warming to complete and generate a Workflows-tuned Bazel rc (via
-  `aspect ci bazelrc`, falling back to `rosetta bazelrc` on older runners).
+  `aspect setup bazelrc`, with a legacy fallback for runners whose CLI
+  predates that task).
 
   Add this as a step after `checkout` and before any step that calls `bazel`
   directly. The rc generator reads the workspace's `.bazelversion`, so the repo

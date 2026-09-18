@@ -19,9 +19,8 @@ runner's remote cache, BES backend, and local NVMe disk cache. Steps that call
 2. Waits for the runner's cache warming to complete (a vanilla `bazel` call would
    otherwise race the still-running bootstrap warming).
 3. Generates a Bazel rc so vanilla `bazel` picks up the Workflows-tuned
-   configuration: `aspect ci bazelrc` (writes `~/.bazelrc`) when available,
-   falling back to `rosetta bazelrc` (writes `/etc/bazel.bazelrc`) on older
-   runners. If neither is available it warns but does not fail the job.
+   configuration: `aspect setup bazelrc` (writes `~/.bazelrc`), with a legacy
+   fallback for runners whose CLI predates that task. If neither is available it warns but does not fail the job.
 
 On a non-Workflows runner it no-ops gracefully.
 

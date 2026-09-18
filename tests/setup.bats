@@ -30,7 +30,7 @@ setup() {
   WORKSPACE_DIR="$(mktemp -d)"
   echo "9.0.0" > "${WORKSPACE_DIR}/.bazelversion"
 
-  # Sandbox HOME so the `aspect ci bazelrc` path (writes ~/.bazelrc) and the
+  # Sandbox HOME so the `aspect setup bazelrc` path (writes ~/.bazelrc) and the
   # plugin's rc dump don't touch the real user's ~/.bazelrc.
   FAKE_HOME="$(mktemp -d)"
   export HOME="${FAKE_HOME}"
@@ -48,13 +48,17 @@ run_hook() {
   run bash -c "cd '${WORKSPACE_DIR}' && '${HOOK}'"
 }
 
-# Put an `aspect` on PATH whose `ci bazelrc` subcommand succeeds: it writes a
-# stub rc to $HOME/.bazelrc (where the real command's default `--output` points)
-# and records that it ran. Any other invocation (e.g. a real task) is a no-op.
+# Put an `aspect` on PATH that knows the bazelrc task under exactly one group
+# name ("setup" on a current CLI, "ci" on one that predates the rename). It
+# writes a stub rc to $HOME/.bazelrc (where the real command's default
+# `--output` points) and records that it ran. Every other group is rejected the
+# way clap rejects an unknown subcommand, so the setup script has to try the
+# next name rather than mistaking a no-op for success.
 stub_aspect() {
+  local group="${1:-setup}"
   cat > "${STUB_BIN}/aspect" <<EOF
 #!/bin/bash
-if [[ "\$1" == "ci" && "\$2" == "bazelrc" ]]; then
+if [[ "\$1" == "${group}" && "\$2" == "bazelrc" ]]; then
   {
     echo 'common --remote_cache=grpcs://example'
     echo 'common --remote_header=x-identity=00000000-0000-0000-0000-000000000000'
@@ -62,14 +66,15 @@ if [[ "\$1" == "ci" && "\$2" == "bazelrc" ]]; then
   touch '${ASPECT_STUB_RAN}'
   exit 0
 fi
-exit 0
+echo "error: unrecognized subcommand '\$1'" >&2
+exit 2
 EOF
   chmod +x "${STUB_BIN}/aspect"
   export PATH="${STUB_BIN}:${PATH}"
 }
 
-# Put an `aspect` on PATH that fails `ci bazelrc` (e.g. a CLI too old to ship the
-# subcommand — clap exits 2 on an unknown subcommand).
+# Put an `aspect` on PATH that knows the bazelrc task under no name at all (a
+# CLI too old to ship it — clap exits 2 on an unknown subcommand).
 stub_old_aspect() {
   cat > "${STUB_BIN}/aspect" <<'EOF'
 #!/bin/bash
@@ -112,7 +117,7 @@ EOF
   refute_output --partial "Detected Aspect Workflows runner"
 }
 
-@test "prefers \`aspect ci bazelrc\` to generate ~/.bazelrc" {
+@test "prefers \`aspect setup bazelrc\` to generate ~/.bazelrc" {
   export ASPECT_WORKFLOWS_RUNNER=1
   export ASPECT_WORKFLOWS_RUNNER_VERSION="2026.22.39"
   export ASPECT_WORKFLOWS_RUNNER_CLOUD_PROVIDER="aws"
@@ -127,7 +132,7 @@ EOF
   assert_output --partial "Workflows version: 2026.22.39"
   assert_output --partial "Cloud provider: AWS"
   assert_output --partial "NVMe storage: yes"
-  assert_output --partial "aspect ci bazelrc"
+  assert_output --partial "aspect setup bazelrc"
 
   # The aspect stub ran and wrote ~/.bazelrc; its contents are echoed to the log.
   [ -f "${ASPECT_STUB_RAN}" ]
@@ -140,6 +145,22 @@ EOF
   refute_output --partial "${BAZELRC_OUT}"
 }
 
+@test "falls back to \`aspect ci bazelrc\` on a CLI that predates the rename" {
+  export ASPECT_WORKFLOWS_RUNNER=1
+  stub_aspect ci   # knows the task only under its older name
+  stub_rosetta     # present but should NOT be used — the alias wins.
+
+  run_hook
+
+  assert_success
+  # It tried the current name first, then the alias, and never reached rosetta.
+  assert_output --partial "aspect setup bazelrc"
+  assert_output --partial "aspect ci bazelrc"
+  [ -f "${ASPECT_STUB_RAN}" ]
+  assert_output --partial "Wrote Workflows-tuned bazelrc to ${HOME}/.bazelrc"
+  refute_output --partial "Wrote Workflows-tuned bazelrc to ${BAZELRC_OUT}"
+}
+
 @test "falls back to \`rosetta bazelrc\` when aspect is too old, with an upgrade hint" {
   export ASPECT_WORKFLOWS_RUNNER=1
   stub_old_aspect
@@ -149,7 +170,7 @@ EOF
 
   assert_success
   # The ci-command failure points users at the aspect-cli releases.
-  assert_output --partial "aspect-cli v2026.26.44 or newer"
+  assert_output --partial "aspect-cli v2026.38.10 or newer"
   assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
   # Then the rosetta fallback writes the system rc and echoes its contents.
   assert_output --partial "Wrote Workflows-tuned bazelrc to ${BAZELRC_OUT}"
@@ -258,7 +279,7 @@ EOF
   # Build is NOT failed: warming is done and `aspect <task>` steps still work.
   assert_success
   assert_output --partial "Could not configure vanilla"
-  assert_output --partial "v2026.26.44 or newer"
+  assert_output --partial "v2026.38.10 or newer"
   assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
   refute_output --partial "Wrote Workflows-tuned bazelrc"
 }
