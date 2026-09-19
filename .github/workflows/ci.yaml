@@ -37,6 +37,13 @@ jobs:
         run: |
           curl -fLSs https://raw.githubusercontent.com/CircleCI-Public/circleci-cli/main/install.sh | sudo bash
       - name: Pack and validate the orb
+        env:
+          CIRCLE_TOKEN: ${{ secrets.CIRCLECI_TOKEN }}
         run: |
+          set -euo pipefail
+          if [[ -z "${CIRCLE_TOKEN}" ]]; then
+            echo "::error::CIRCLECI_TOKEN repo secret is not set or is unavailable to this run. Create a CircleCI personal API token (https://app.circleci.com/settings/user/tokens) and add it as the CIRCLECI_TOKEN secret on this repo."
+            exit 1
+          fi
           circleci orb pack src > orb.yml
-          circleci orb validate orb.yml
+          circleci orb validate orb.yml --token "${CIRCLE_TOKEN}"
