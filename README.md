@@ -1,28 +1,66 @@
-# Aspect Workflows CircleCI orb
+# Setup Aspect CircleCI orb
 
-A [CircleCI orb](https://circleci.com/docs/orb-intro/) that prepares an
-[Aspect Workflows](https://docs.aspect.build/workflows) CI runner so that **raw
-`bazel <verb>` calls** — not just `aspect <task>` — route through the runner's
-caching infrastructure.
+A [CircleCI orb](https://circleci.com/docs/orb-intro/) that sets a job up so
+that **raw `bazel <verb>` calls** — not just `aspect <task>` — reach an Aspect
+cache.
 
 The CircleCI counterpart of the [`aspect-build/setup-aspect`](https://github.com/aspect-build/setup-aspect)
 GitHub Action and the [`aspect-build/setup-aspect-buildkite-plugin`](https://github.com/aspect-build/setup-aspect-buildkite-plugin)
 Buildkite plugin.
 
-## Why
+## Two modes
 
-On an Aspect Workflows runner, `aspect <task>` already wires itself into the
-runner's remote cache, BES backend, and local NVMe disk cache. Steps that call
-`bazel` directly would otherwise miss all of that. The orb's `setup` command:
+The setup looks at `ASPECT_WORKFLOWS_RUNNER` and takes one of two paths.
 
-1. Logs the runner's metadata for traceability.
-2. Waits for the runner's cache warming to complete (a vanilla `bazel` call would
-   otherwise race the still-running bootstrap warming).
-3. Generates a Bazel rc so vanilla `bazel` picks up the Workflows-tuned
-   configuration: `aspect setup bazelrc` (writes `~/.bazelrc`), with a legacy
-   fallback for runners whose CLI predates that task. If neither is available it warns but does not fail the job.
+### On any CircleCI executor — the Aspect remote cache
 
-On a non-Workflows runner it no-ops gracefully.
+This is the path that lets an existing pipeline try Aspect without moving to
+Aspect Workflows runners. It:
+
+1. **Installs the Aspect CLI launcher and Bazelisk**, each skipped when the
+   binary is already on `PATH`. The launcher reads `.aspect/version.axl` from
+   your repository and fetches the matching CLI on first use, so the CLI version
+   stays pinned by the repo; `ASPECT_LAUNCHER_VERSION` pins only the launcher.
+2. **Authenticates** with `aspect auth login --with-api-token` when
+   `ASPECT_API_TOKEN` is set. The token is piped on stdin — never an argument —
+   and the short-lived JWT the CLI persists is what later `aspect` calls and the
+   Bazel credential helper use.
+3. **Writes `~/.bazelrc`** with `aspect setup bazelrc --home`, pointing vanilla
+   `bazel` at the Aspect deployment's remote cache and BES. A plain
+   `bazel build //...` then shares a cache with every other job and branch and
+   streams the build to Aspect; `aspect build --remote //...` reaches the same
+   deployment.
+
+`--home` is what keeps the rc out of the checkout. Without it the task writes
+`<workspace>/.aspect/bazelrc` and a `try-import` in the workspace `.bazelrc` —
+files meant to be committed, not generated on a runner and thrown away with it.
+
+### On an Aspect Workflows runner — the runner's own caches
+
+`aspect <task>` already wires itself into the runner's remote cache, BES
+backend, and local NVMe disk cache. Steps that call `bazel` directly would otherwise miss all of
+that, so the setup:
+
+1. **Logs the runner's metadata** for traceability.
+2. **Waits for cache warming to complete.** `aspect <task>` performs this wait
+   itself; a vanilla `bazel` call would otherwise race the still-running
+   bootstrap warming — competing for CPU/disk and missing the warmed caches.
+3. **Authenticates**, as above.
+4. **Generates the runner's Bazel rc** via `aspect setup bazelrc`, with a legacy
+   fallback for runners whose CLI predates that task. If neither is available it
+   warns but **does not fail the build** — warming is done and `aspect <task>`
+   steps are unaffected.
+
+## Authentication
+
+Set `ASPECT_API_TOKEN` to a long-lived `<CLIENT_ID>:<SECRET>` Aspect API token,
+from a CircleCI context or project environment variable. Without it the rc is still written — the task defaults to the
+Aspect Cloud deployment and needs no login — but Bazel will reach that cache
+unauthenticated.
+
+The orb appends its `PATH` additions to `${BASH_ENV}`, so `aspect` and `bazel`
+are on `PATH` in the job's later steps, not just inside the `setup` command.
+
 
 ## Usage
 

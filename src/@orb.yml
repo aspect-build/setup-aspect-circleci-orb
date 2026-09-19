@@ -1,11 +1,14 @@
 version: 2.1
 
 description: >
-  Prepares an Aspect Workflows CI runner so that vanilla `bazel` calls — not just
-  `aspect <task>` — route through the runner's caching infrastructure. The
-  `setup` command waits for the runner's cache warming to complete and generates
-  a Bazel rc via `aspect setup bazelrc`, with a legacy fallback for runners
-  whose CLI predates that task. The CircleCI counterpart of
+  Sets a CircleCI job up so that vanilla `bazel` calls — not just
+  `aspect <task>` — reach an Aspect cache. On a stock executor the `setup`
+  command installs the Aspect CLI launcher and Bazelisk, authenticates with
+  ASPECT_API_TOKEN when that variable is set, and writes a ~/.bazelrc pointing
+  at the Aspect deployment's remote cache and BES via
+  `aspect setup bazelrc --home`. On an Aspect Workflows runner it instead waits
+  for cache warming and generates the runner's own rc, with a legacy fallback
+  for runners whose CLI predates that task. The CircleCI counterpart of
   aspect-build/setup-aspect (GitHub Actions) and
   aspect-build/setup-aspect-buildkite-plugin (Buildkite).
 

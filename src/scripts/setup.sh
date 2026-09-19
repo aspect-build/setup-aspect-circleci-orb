@@ -1,31 +1,44 @@
 #!/bin/bash
 #
-# Configure an Aspect Workflows runner so that raw `bazel <verb>` calls — not
-# just `aspect <task>` — route through the runner's caching infrastructure.
+# Configure a CI runner so that raw `bazel <verb>` calls — not just
+# `aspect <task>` — reach an Aspect cache.
 #
-# This is the provider-neutral core shared (vendored) by the Aspect Workflows
-# CI integrations: the Buildkite plugin, the CircleCI orb, and the GitLab
-# component. It does, in order:
+# This is the provider-neutral core shared (vendored) by the Aspect CI
+# integrations: the Buildkite plugin, the CircleCI orb, and the GitLab
+# component. It takes one of two paths depending on the runner.
 #
-#   1. Guard on ASPECT_WORKFLOWS_RUNNER; no-op gracefully when unset.
-#   2. Log the runner's metadata (the ASPECT_WORKFLOWS_RUNNER_* table).
-#   3. Wait for the runner's cache warming to complete — `aspect <task>` does
+# On an Aspect Workflows runner it routes vanilla `bazel` through the runner's
+# own caching infrastructure:
+#
+#   1. Log the runner's metadata (the ASPECT_WORKFLOWS_RUNNER_* table).
+#   2. Wait for the runner's cache warming to complete — `aspect <task>` does
 #      this itself, but a vanilla `bazel` call would otherwise race the still-running
 #      bootstrap warming (competing for CPU/disk, missing the warmed caches).
-#   4. Pre-flight the .bazelversion check, so a workspace that cannot produce
-#      an rc fails with an actionable message instead of an opaque one.
-#   5. Write the Workflows-tuned bazelrc, so every later `bazel` call in the job
+#   3. Authenticate, if ASPECT_API_TOKEN is set.
+#   4. Write the Workflows-tuned bazelrc, so every later `bazel` call in the job
 #      picks up the runner's remote cache, repository cache and output paths.
-#   6. Emit a deprecation signal when the runner signals a newer
-#      bazelrc-generation mechanism.
+#
+# On any other runner — a stock Buildkite agent, CircleCI executor, or GitLab
+# runner — it sets the job up against an Aspect deployment's remote cache
+# instead, which is the whole setup needed to try Aspect on existing CI:
+#
+#   1. Install the Aspect CLI launcher and Bazelisk, each skipped when the
+#      binary is already on PATH.
+#   2. Authenticate, if ASPECT_API_TOKEN is set.
+#   3. Run `aspect setup bazelrc --home`, writing a ~/.bazelrc that points
+#      vanilla `bazel` at the deployment's remote cache and BES. `aspect build
+#      --remote //...` reaches the same deployment.
+#
+# `--home` is what keeps the rc out of the checkout: without it the task writes
+# <workspace>/.aspect/bazelrc plus a try-import in the workspace .bazelrc, files
+# meant to be committed rather than generated on a runner.
 #
 # It must run AFTER the repository checkout (so .bazelversion / the workspace
 # exist, with CWD at the workspace root) and BEFORE the first vanilla `bazel` call.
 #
-# Ported from aspect-build/setup-aspect's setupOnWorkflowsRunner. Each provider
-# integration vendors a copy of this file and invokes it from its own
-# entry point (Buildkite pre-command hook, CircleCI orb command, GitLab
-# component before_script).
+# Ported from aspect-build/setup-aspect's index.js. Each provider integration
+# vendors a copy of this file and invokes it from its own entry point (Buildkite
+# pre-command hook, CircleCI orb command, GitLab component before_script).
 
 set -euo pipefail
 
@@ -37,9 +50,21 @@ SYSTEM_BAZELRC="${ASPECT_WORKFLOWS_PLUGIN_SYSTEM_BAZELRC:-/etc/bazel.bazelrc}"
 # Named in the upgrade hint shown when the runner's CLI cannot generate the rc.
 ASPECT_SETUP_BAZELRC_MIN_VERSION="v2026.38.10"
 ASPECT_CLI_RELEASES_URL="https://github.com/aspect-build/aspect-cli/releases"
+BAZELISK_RELEASES_URL="https://github.com/bazelbuild/bazelisk/releases"
 
 # Path the bazelrc task writes to (its default, the first user rc Bazel loads).
 USER_BAZELRC="${HOME}/.bazelrc"
+
+# Where the launcher and Bazelisk are installed when this script has to fetch
+# them, and which it prepends to PATH. Overridable so a job can place them on a
+# cached volume, and so the tests can keep out of $HOME.
+ASPECT_SETUP_BIN_DIR="${ASPECT_SETUP_BIN_DIR:-${HOME}/.aspect/setup-bin}"
+
+# Optional pin for the Aspect CLI launcher, e.g. "2026.38.24". Empty installs
+# the latest release. The *CLI* version is pinned by .aspect/version.axl in the
+# repository, which the launcher reads on first use — this only pins the
+# launcher that reads it.
+ASPECT_LAUNCHER_VERSION="${ASPECT_LAUNCHER_VERSION:-}"
 
 log() {
   echo "$@"
@@ -48,7 +73,6 @@ log() {
 warn() {
   echo "⚠️  $*" >&2
 }
-
 # Render the `1`/unset boolean runner flags as yes/no, matching the Aspect CLI's
 # own "Workflows runner metadata" block.
 yesno() {
@@ -142,36 +166,184 @@ print_bazelrc() {
     -e 's/^/  /' \
     "${path}"
 }
+# Prepend a directory to PATH for this shell and, where the provider supports
+# it, for the job's later steps. Buildkite hooks and GitLab before_script share
+# one shell with the commands that follow, so the export alone carries; CircleCI
+# runs each step in a fresh shell and sources ${BASH_ENV} into it, so the export
+# is written there too.
+add_to_path() {
+  local dir="$1"
+  export PATH="${dir}:${PATH}"
+  if [[ -n "${BASH_ENV:-}" ]]; then
+    echo "export PATH=\"${dir}:\${PATH}\"" >> "${BASH_ENV}"
+  fi
+}
 
-# Preferred generator: `aspect setup bazelrc`.
+# Download `url` to `dest` and make it executable. Written to a temp file first
+# so a failed or partial download never leaves a truncated binary on PATH.
+download_binary() {
+  local url="$1" dest="$2" tmp
+  tmp="$(mktemp "${dest}.XXXXXX")"
+  if ! curl -fsSL --retry 3 -o "${tmp}" "${url}"; then
+    rm -f "${tmp}"
+    warn "Failed to download ${url}."
+    return 1
+  fi
+  chmod +x "${tmp}"
+  mv -f "${tmp}" "${dest}"
+}
+
+# This machine in the arch-platform spelling the release assets use. Echoes
+# "<arch> <platform>" for the Aspect launcher, whose naming mirrors
+# install.aspect.build; Bazelisk's own spelling is derived from it below.
+host_triple() {
+  local arch platform
+  case "$(uname -m)" in
+    x86_64 | amd64) arch="x86_64" ;;
+    arm64 | aarch64) arch="aarch64" ;;
+    *) warn "Unsupported architecture $(uname -m) for the Aspect CLI launcher."; return 1 ;;
+  esac
+  case "$(uname -s)" in
+    Darwin) platform="apple-darwin" ;;
+    Linux) platform="unknown-linux-musl" ;;
+    *) warn "Unsupported platform $(uname -s) for the Aspect CLI launcher — Linux and macOS only."; return 1 ;;
+  esac
+  echo "${arch} ${platform}"
+}
+
+# Put `aspect` on PATH, installing the launcher when it is missing.
+#
+# The launcher is a small binary that reads .aspect/version.axl from the
+# repository and downloads the matching CLI on first use, so pinning the CLI
+# stays the repository's job and ASPECT_LAUNCHER_VERSION only pins the reader.
+ensure_aspect() {
+  if command -v aspect > /dev/null 2>&1; then
+    log "\`aspect\` already on PATH — skipping the Aspect CLI launcher install."
+    return 0
+  fi
+
+  local arch platform
+  read -r arch platform <<< "$(host_triple)" || return 1
+  [[ -n "${platform}" ]] || return 1
+
+  local asset="aspect-launcher-${arch}-${platform}" url
+  if [[ -n "${ASPECT_LAUNCHER_VERSION}" ]]; then
+    url="${ASPECT_CLI_RELEASES_URL}/download/v${ASPECT_LAUNCHER_VERSION#v}/${asset}"
+  else
+    url="${ASPECT_CLI_RELEASES_URL}/latest/download/${asset}"
+  fi
+
+  log "Installing the Aspect CLI launcher (${ASPECT_LAUNCHER_VERSION:-latest}) from ${url}"
+  mkdir -p "${ASPECT_SETUP_BIN_DIR}"
+  download_binary "${url}" "${ASPECT_SETUP_BIN_DIR}/aspect" || return 1
+  add_to_path "${ASPECT_SETUP_BIN_DIR}"
+  log "Installed \`aspect\` to ${ASPECT_SETUP_BIN_DIR}/aspect"
+}
+
+# Put `bazel` on PATH via Bazelisk, unless something already provides it (a
+# setup-bazel-style step earlier in the pipeline, or the runner image).
+#
+# A failure here is only warned: the job may well not need `bazel` at all, and
+# `aspect <task>` brings its own.
+ensure_bazel() {
+  if command -v bazel > /dev/null 2>&1; then
+    log "\`bazel\` already on PATH — skipping the Bazelisk install."
+    return 0
+  fi
+
+  local arch platform
+  case "$(uname -m)" in
+    x86_64 | amd64) arch="amd64" ;;
+    arm64 | aarch64) arch="arm64" ;;
+    *) warn "Unsupported architecture $(uname -m) for Bazelisk."; return 1 ;;
+  esac
+  case "$(uname -s)" in
+    Darwin) platform="darwin" ;;
+    Linux) platform="linux" ;;
+    *) warn "Unsupported platform $(uname -s) for Bazelisk."; return 1 ;;
+  esac
+
+  local url="${BAZELISK_RELEASES_URL}/latest/download/bazelisk-${platform}-${arch}"
+  log "Installing Bazelisk from ${url}"
+  mkdir -p "${ASPECT_SETUP_BIN_DIR}"
+  download_binary "${url}" "${ASPECT_SETUP_BIN_DIR}/bazel" || return 1
+  add_to_path "${ASPECT_SETUP_BIN_DIR}"
+  log "Installed \`bazel\` (Bazelisk) to ${ASPECT_SETUP_BIN_DIR}/bazel"
+}
+
+# Exchange a long-lived ASPECT_API_TOKEN for a session JWT, which the CLI
+# persists for every later `aspect` call in the job and which the `aspect`
+# credential helper named by the generated rc hands to Bazel.
+#
+# The token is piped on stdin, never passed as an argument, so it stays out of
+# the process table and the job log. A failure is warned, not fatal: a job that
+# does not touch the Aspect API still runs fine unauthenticated.
+login_if_api_token() {
+  if [[ -z "${ASPECT_API_TOKEN:-}" ]]; then
+    log "ASPECT_API_TOKEN is not set — skipping \`aspect auth login\`."
+    return 0
+  fi
+
+  if ! command -v aspect > /dev/null 2>&1; then
+    warn "ASPECT_API_TOKEN is set but \`aspect\` is not on PATH, so the token could not be exchanged for a session JWT."
+    return 0
+  fi
+
+  log "Exchanging ASPECT_API_TOKEN for a session JWT"
+  local status=0
+  printf '%s' "${ASPECT_API_TOKEN}" | aspect auth login --with-api-token || status=$?
+  if [[ "${status}" -ne 0 ]]; then
+    warn "\`aspect auth login --with-api-token\` failed (exit ${status}). Later steps that need Aspect API access will fail to authenticate."
+    return 0
+  fi
+  log "Persisted Aspect session JWT for later \`aspect\` invocations"
+}
+
+# Run the rc-generating task, passing through any extra arguments, and report
+# whether it wrote the rc.
+#
+# `ci` is the group the task shipped under, still accepted as an alias, so both
+# are tried: a non-zero exit means this CLI does not know that name (or, for
+# --home, that flag), not that generating the rc failed.
+run_bazelrc_task() {
+  local description="$1"
+  shift
+  local -a extra=("$@")
+
+  local group status=0
+  for group in setup ci; do
+    log "Generating ${USER_BAZELRC} via \`aspect ${group} bazelrc ${extra[*]:-}\`"
+    status=0
+    aspect "${group}" bazelrc ${extra[@]+"${extra[@]}"} || status=$?
+    if [[ "${status}" -eq 0 ]]; then
+      log "Wrote ${description} bazelrc to ${USER_BAZELRC}"
+      print_bazelrc "${USER_BAZELRC}"
+      return 0
+    fi
+    log "\`aspect ${group} bazelrc ${extra[*]:-}\` is unavailable in this Aspect CLI (exit ${status})."
+  done
+  return "${status}"
+}
+
+# Preferred generator on a Workflows runner: `aspect setup bazelrc`.
 #
 # Writes ~/.bazelrc (the first user rc Bazel loads) with the runner's remote
 # cache, repository cache, and output flags — the same flags `aspect <task>`
 # injects. It reads the runner's environment, not a Workflows config, so no
-# throwaway config or `.bazelversion` plumbing is needed.
+# throwaway config or `.bazelversion` plumbing is needed, and no --home: on a
+# runner the rc the task writes is already the home rc.
 #
 # Returns 0 once the rc is written, non-zero if this CLI cannot write it.
 aspect_setup_bazelrc() {
   command -v aspect > /dev/null 2>&1 || return 127
 
-  # `ci` is the group the task shipped under, still accepted as an alias.
-  local group status=0
-  for group in setup ci; do
-    log "Generating ${USER_BAZELRC} via \`aspect ${group} bazelrc\`"
-    status=0
-    aspect "${group}" bazelrc || status=$?
-    if [[ "${status}" -eq 0 ]]; then
-      log "Wrote Workflows-tuned bazelrc to ${USER_BAZELRC}"
-      print_bazelrc "${USER_BAZELRC}"
-      return 0
-    fi
-    log "\`aspect ${group} bazelrc\` is unavailable in this Aspect CLI (exit ${status})."
-  done
+  local status=0
+  run_bazelrc_task "Workflows-tuned" || status=$?
+  [[ "${status}" -eq 0 ]] && return 0
 
   warn "This Aspect CLI cannot run \`aspect setup bazelrc\`; it requires aspect-cli ${ASPECT_SETUP_BAZELRC_MIN_VERSION} or newer (${ASPECT_CLI_RELEASES_URL}). Trying the legacy generator instead."
   return "${status}"
 }
-
 # Legacy fallback generator, for runners whose CLI predates the bazelrc task.
 #
 # `rosetta bazelrc` reads .aspect/workflows/config.yaml by default and fails if
@@ -213,10 +385,9 @@ rosetta_bazelrc() {
   log "Wrote Workflows-tuned bazelrc to ${SYSTEM_BAZELRC}"
   print_bazelrc "${SYSTEM_BAZELRC}"
 }
-
-# Configure vanilla `bazel` calls. If no generator can run, warn — but do NOT
-# fail the build: warming has already completed and `aspect <task>` steps still
-# work; only vanilla `bazel` calls go unconfigured.
+# Configure vanilla `bazel` calls on a Workflows runner. If no generator can
+# run, warn — but do NOT fail the build: warming has already completed and
+# `aspect <task>` steps still work; only vanilla `bazel` calls go unconfigured.
 write_bazelrc() {
   if aspect_setup_bazelrc; then
     return 0
@@ -230,19 +401,63 @@ write_bazelrc() {
   return 0
 }
 
-main() {
-  if [[ -z "${ASPECT_WORKFLOWS_RUNNER:-}" ]]; then
-    log "Not an Aspect Workflows runner (ASPECT_WORKFLOWS_RUNNER unset) — skipping Aspect Workflows setup."
+# Point vanilla `bazel` at an Aspect deployment's remote cache and BES, by
+# writing ~/.bazelrc with `aspect setup bazelrc --home`.
+#
+# The task defaults to the Aspect Cloud deployment and needs no login to write
+# the rc; ASPECT_API_TOKEN is what lets Bazel authenticate to the cache the rc
+# names, and a token for a single-tenant deployment also gives that deployment
+# its own `--config` section here.
+#
+# A failure is warned, not fatal: the job still builds, just without the cache.
+write_cloud_bazelrc() {
+  if ! command -v aspect > /dev/null 2>&1; then
+    warn "\`aspect\` is not on PATH, so \`aspect setup bazelrc --home\` could not run and \`bazel\` will not reach the Aspect remote cache."
     return 0
   fi
 
+  local status=0
+  run_bazelrc_task "Aspect remote cache" --home || status=$?
+  [[ "${status}" -eq 0 ]] && return 0
+
+  warn "This Aspect CLI cannot run \`aspect setup bazelrc --home\`, so \`bazel\` will not reach the Aspect remote cache (${ASPECT_CLI_RELEASES_URL}). Upgrade the CLI, or configure Bazel's remote cache yourself."
+  return 0
+}
+
+# An Aspect Workflows runner: the caches are the runner's own, and the rc is
+# generated from its environment.
+setup_workflows_runner() {
   log "Detected Aspect Workflows runner (ASPECT_WORKFLOWS_RUNNER set)"
 
   log_workflows_runner_metadata
 
   wait_for_warming
 
+  login_if_api_token
+
   write_bazelrc
+}
+
+# Any other runner: install what the job needs, then point Bazel at the
+# deployment's remote cache. This is the path that lets an existing Buildkite,
+# CircleCI, or GitLab pipeline use Aspect without moving to Workflows runners.
+setup_vanilla_runner() {
+  log "Not an Aspect Workflows runner — setting up for the Aspect remote cache."
+
+  ensure_aspect || return 0
+  ensure_bazel || true
+
+  login_if_api_token
+
+  write_cloud_bazelrc
+}
+
+main() {
+  if [[ -n "${ASPECT_WORKFLOWS_RUNNER:-}" ]]; then
+    setup_workflows_runner
+  else
+    setup_vanilla_runner
+  fi
 }
 
 main "$@"
