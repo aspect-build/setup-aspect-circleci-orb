@@ -48,9 +48,10 @@ set -euo pipefail
 # tests (writing the real path requires root, which a test environment lacks).
 SYSTEM_BAZELRC="${ASPECT_WORKFLOWS_PLUGIN_SYSTEM_BAZELRC:-/etc/bazel.bazelrc}"
 
-# The aspect-cli release that ships `aspect setup bazelrc`, and where to get it.
-# Named in the upgrade hint shown when the runner's CLI cannot write ~/.aspect/bazelrc.
-ASPECT_SETUP_BAZELRC_MIN_VERSION="v2026.38.30"
+# The aspect-cli release the upgrade hints name, and where to get it. The
+# oldest release this plugin asks for rather than the oldest that can run
+# `aspect setup bazelrc`: it moves with the fixes a working setup depends on.
+ASPECT_SETUP_BAZELRC_MIN_VERSION="v2026.38.34"
 ASPECT_CLI_RELEASES_URL="https://github.com/aspect-build/aspect-cli/releases"
 BAZELISK_RELEASES_URL="https://github.com/bazelbuild/bazelisk/releases"
 
@@ -410,7 +411,7 @@ aspect_setup_bazelrc() {
   run_configured_bazelrc_task "Workflows-tuned" || status=$?
   [[ "${status}" -eq 0 ]] && return 0
 
-  warn "This Aspect CLI cannot run \`aspect setup bazelrc\`; it requires aspect-cli ${ASPECT_SETUP_BAZELRC_MIN_VERSION} or newer (${ASPECT_CLI_RELEASES_URL}). Trying the legacy generator instead."
+  warn "This Aspect CLI cannot run \`aspect setup bazelrc\`; upgrade to aspect-cli ${ASPECT_SETUP_BAZELRC_MIN_VERSION} or newer (${ASPECT_CLI_RELEASES_URL}). Trying the legacy generator instead."
   return "${status}"
 }
 # Legacy fallback generator, for runners whose CLI predates the bazelrc task.
@@ -466,7 +467,7 @@ write_bazelrc() {
     return 0
   fi
 
-  warn "Could not configure vanilla \`bazel\` calls on this Workflows runner: no bazelrc generator is available. Warming completed and \`aspect <task>\` steps are unaffected, but vanilla \`bazel\` calls will not pick up the runner's remote cache, repository cache, or disk cache and so will not function correctly. Upgrade aspect-cli to ${ASPECT_SETUP_BAZELRC_MIN_VERSION} or newer for \`aspect setup bazelrc\` (${ASPECT_CLI_RELEASES_URL})."
+  warn "Could not configure vanilla \`bazel\` calls on this Workflows runner: no bazelrc generator is available. Warming completed and \`aspect <task>\` steps are unaffected, but vanilla \`bazel\` calls will not pick up the runner's remote cache, repository cache, or disk cache and so will not function correctly. Upgrade aspect-cli to ${ASPECT_SETUP_BAZELRC_MIN_VERSION} or newer (${ASPECT_CLI_RELEASES_URL})."
   return 0
 }
 
