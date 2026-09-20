@@ -37,10 +37,21 @@ setup() {
 
   # Marker file written by the `aspect` stub so a test can prove it ran.
   ASPECT_STUB_RAN="$(mktemp -u)"
+
+  # Where the `aspect` stub saves the token it was fed on stdin, so a test can
+  # prove the login ran and what it was given.
+  ASPECT_STUB_TOKEN="$(mktemp -u)"
+
+  # The vanilla-runner path installs the launcher and Bazelisk when they are
+  # missing. Point that at a temp dir so it stays out of $HOME — every test that
+  # takes this path stubs both binaries, so nothing here reaches the network.
+  ASPECT_SETUP_BIN_DIR="$(mktemp -d)"
+  export ASPECT_SETUP_BIN_DIR
 }
 
 teardown() {
-  rm -rf "${BAZELRC_OUT}" "${STUB_BIN}" "${WORKSPACE_DIR}" "${FAKE_HOME}" "${ASPECT_STUB_RAN}"
+  rm -rf "${BAZELRC_OUT}" "${STUB_BIN}" "${WORKSPACE_DIR}" "${FAKE_HOME}" \
+    "${ASPECT_STUB_RAN}" "${ASPECT_STUB_TOKEN}" "${ASPECT_SETUP_BIN_DIR}"
 }
 
 # Run the hook from inside the fake workspace (CWD with a .bazelversion).
@@ -109,12 +120,307 @@ EOF
   export PATH="${STUB_BIN}:${PATH}"
 }
 
-@test "no-ops when not on an Aspect Workflows runner" {
+# Put an `aspect` on PATH that behaves like a current CLI off a Workflows
+# runner: it knows `setup bazelrc --home` and `auth login --with-api-token`, and
+# records what it was asked to do. Anything else is rejected the way clap
+# rejects an unknown subcommand.
+stub_cloud_aspect() {
+  cat > "${STUB_BIN}/aspect" <<EOF
+#!/bin/bash
+if [[ "\$1" == "auth" && "\$2" == "login" && "\$3" == "--with-api-token" ]]; then
+  cat > '${ASPECT_STUB_TOKEN}'
+  exit 0
+fi
+if [[ "\$1" == "setup" && "\$2" == "bazelrc" ]]; then
+  # A current CLI: the task needs no flags, and rejects ones it does not know
+  # the way clap does, with exit 2.
+  for arg in "\${@:3}"; do
+    case "\$arg" in
+      --home|--home=*|--remote|--remote=*|--force) ;;
+      *) echo "error: unexpected argument '\$arg'" >&2; exit 2 ;;
+    esac
+  done
+  echo 'common --remote_cache=grpcs://cloud.aspect.build' > "\${HOME}/.bazelrc"
+  touch '${ASPECT_STUB_RAN}'
+  exit 0
+fi
+echo "error: unrecognized subcommand '\$*'" >&2
+exit 2
+EOF
+  chmod +x "${STUB_BIN}/aspect"
+  export PATH="${STUB_BIN}:${PATH}"
+}
+
+# An `aspect` that ships the bazelrc task but none of the flags this script can
+# configure, the way a CLI older than one of them behaves: bare runs write the
+# rc, anything with an argument exits 2.
+stub_flagless_aspect() {
+  cat > "${STUB_BIN}/aspect" <<EOF
+#!/bin/bash
+if [[ "\$1" == "setup" && "\$2" == "bazelrc" ]]; then
+  if [[ -n "\${3:-}" ]]; then
+    echo "error: unexpected argument '\$3' found" >&2
+    exit 2
+  fi
+  echo 'common --remote_cache=grpcs://cloud.aspect.build' > "\${HOME}/.bazelrc"
+  touch '${ASPECT_STUB_RAN}'
+  exit 0
+fi
+echo "error: unrecognized subcommand '\$*'" >&2
+exit 2
+EOF
+  chmod +x "${STUB_BIN}/aspect"
+  export PATH="${STUB_BIN}:${PATH}"
+}
+
+# A no-op `bazel`, so the vanilla path skips its Bazelisk install.
+stub_bazel() {
+  printf '#!/bin/bash\nexit 0\n' > "${STUB_BIN}/bazel"
+  chmod +x "${STUB_BIN}/bazel"
+  export PATH="${STUB_BIN}:${PATH}"
+}
+
+@test "uses no builtin the macOS system bash lacks" {
+  # The shebang asks for `/bin/bash`, which on macOS is 3.2.57 — no `mapfile`
+  # or `readarray`. A missing builtin there is quiet: the array stays empty and
+  # the flags a pipeline configured never reach the command line. This image
+  # runs bash 5, so only a scan catches one coming back.
+  run grep -nE "^[[:space:]]*(mapfile|readarray)\\b" "${HOOK}"
+  assert_failure
+}
+
+@test "points vanilla bazel at the Aspect remote cache when off a Workflows runner" {
+  stub_cloud_aspect
+  stub_bazel
+
   run_hook
 
   assert_success
   assert_output --partial "Not an Aspect Workflows runner"
   refute_output --partial "Detected Aspect Workflows runner"
+
+  # The rc came from an unadorned `aspect setup bazelrc` and is echoed.
+  assert_output --partial "aspect setup bazelrc"
+  assert_output --partial "Wrote Aspect remote cache bazelrc to ${HOME}/.bazelrc"
+  assert_output --partial "common --remote_cache=grpcs://cloud.aspect.build"
+  [ -f "${ASPECT_STUB_RAN}" ]
+
+  # Nothing on this path touches the Workflows-runner machinery.
+  refute_output --partial "Wrote Workflows-tuned bazelrc"
+}
+
+@test "disables the cache in the rc when the token exchange fails" {
+  cat > "${STUB_BIN}/aspect" <<EOF
+#!/bin/bash
+if [[ "\$1" == "auth" && "\$2" == "login" ]]; then
+  echo "error: invalid token" >&2
+  exit 1
+fi
+if [[ "\$1" == "setup" && "\$2" == "bazelrc" ]]; then
+  echo "ran: \$*" > "\${HOME}/.bazelrc"
+  exit 0
+fi
+exit 2
+EOF
+  chmod +x "${STUB_BIN}/aspect"
+  export PATH="${STUB_BIN}:${PATH}"
+  stub_bazel
+  export ASPECT_API_TOKEN="client_id:secret"
+
+  run_hook
+
+  assert_success
+  # Pointing Bazel at a cache it cannot authenticate to fails the build, so the
+  # rc is written with the endpoints off rather than not written at all.
+  assert_output --partial "will not enable the remote cache or BES"
+  assert_output --partial "aspect setup bazelrc --remote=none"
+}
+
+@test "passes the configured remote, home and force through to the rc task" {
+  stub_cloud_aspect
+  stub_bazel
+  export ASPECT_SETUP_REMOTE="exec"
+  export ASPECT_SETUP_FORCE="true"
+
+  run_hook
+
+  assert_success
+  assert_output --partial "aspect setup bazelrc --remote=exec --force"
+}
+
+@test "passes a configured home straight through" {
+  stub_cloud_aspect
+  stub_bazel
+  export ASPECT_SETUP_HOME="false"
+
+  run_hook
+
+  assert_success
+  assert_output --partial "aspect setup bazelrc --home=false"
+}
+
+@test "passes no rc flags when the orb is unconfigured" {
+  stub_cloud_aspect
+  stub_bazel
+
+  run_hook
+
+  assert_success
+  # Unconfigured is an unadorned run: the CLI detects CI and picks the home rc.
+  assert_output --partial "aspect setup bazelrc"
+  refute_output --partial "--home"
+  refute_output --partial "--remote="
+  refute_output --partial "--force"
+}
+
+@test "exchanges ASPECT_API_TOKEN for a session JWT off a Workflows runner" {
+  export ASPECT_API_TOKEN="client_id:secret"
+  stub_cloud_aspect
+  stub_bazel
+
+  run_hook
+
+  assert_success
+  assert_output --partial "Persisted Aspect session JWT"
+  # Fed on stdin, so the token never reaches the process table or the log.
+  assert_equal "$(cat "${ASPECT_STUB_TOKEN}")" "client_id:secret"
+  refute_output --partial "client_id:secret"
+}
+
+@test "skips the login when ASPECT_API_TOKEN is unset" {
+  stub_cloud_aspect
+  stub_bazel
+
+  run_hook
+
+  assert_success
+  assert_output --partial "ASPECT_API_TOKEN is not set"
+  refute_output --partial "Persisted Aspect session JWT"
+  [ ! -f "${ASPECT_STUB_TOKEN}" ]
+}
+
+@test "skips the installs when aspect and bazel are already on PATH" {
+  stub_cloud_aspect
+  stub_bazel
+
+  run_hook
+
+  assert_success
+  assert_output --partial "\`aspect\` already on PATH"
+  assert_output --partial "\`bazel\` already on PATH"
+  refute_output --partial "Installing the Aspect CLI launcher"
+  refute_output --partial "Installing Bazelisk"
+}
+
+@test "writes no rc when generation is turned off" {
+  stub_cloud_aspect
+  stub_bazel
+  export ASPECT_SETUP_GENERATE="false"
+
+  run_hook
+
+  # The point of the setting: everything but the rc still happens, which is what
+  # makes it different from dropping the setup.
+  assert_success
+  assert_output --partial "leaving Bazel's configuration to this repository"
+  refute_output --partial "aspect setup bazelrc"
+  [ ! -f "${ASPECT_STUB_RAN}" ]
+  assert_output --partial "\`aspect\` already on PATH"
+}
+
+@test "writes no rc on a Workflows runner either when generation is turned off" {
+  export ASPECT_WORKFLOWS_RUNNER=1
+  export ASPECT_SETUP_GENERATE="false"
+  stub_aspect
+  stub_rosetta
+
+  run_hook
+
+  assert_success
+  assert_output --partial "leaving Bazel's configuration to this repository"
+  refute_output --partial "Wrote Workflows-tuned bazelrc"
+  [ ! -f "${ASPECT_STUB_RAN}" ]
+}
+
+@test "retries bare when the CLI rejects a configured flag" {
+  stub_flagless_aspect
+  stub_bazel
+  export ASPECT_SETUP_FORCE="true"
+
+  run_hook
+
+  # A CLI too old for a configured flag still writes the rc without it.
+  assert_success
+  assert_output --partial "\`aspect setup bazelrc --force\` is unavailable"
+  assert_output --partial "Wrote Aspect remote cache bazelrc to ${HOME}/.bazelrc"
+  [ -f "${ASPECT_STUB_RAN}" ]
+}
+
+@test "warns without failing when the CLI has no bazelrc task at all" {
+  stub_old_aspect
+  stub_bazel
+
+  run_hook
+
+  # An unconfigurable CLI leaves the job uncached, not broken.
+  assert_success
+  assert_output --partial "cannot run \`aspect setup bazelrc\`"
+  assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
+}
+
+@test "echoes the generated rc, not just the rc that imports it" {
+  cat > "${STUB_BIN}/aspect" <<EOF
+#!/bin/bash
+if [[ "\$1" == "setup" && "\$2" == "bazelrc" ]]; then
+  mkdir -p "\${HOME}/.aspect"
+  echo "try-import \${HOME}/.aspect/bazelrc" > "\${HOME}/.bazelrc"
+  {
+    echo 'common:aspect-cloud --remote_cache=grpcs://cache.aspect.build'
+    echo 'common:aspect-cloud --remote_header=x-aspect-token=secret-token-value'
+  } > "\${HOME}/.aspect/bazelrc"
+  exit 0
+fi
+exit 2
+EOF
+  chmod +x "${STUB_BIN}/aspect"
+  export PATH="${STUB_BIN}:${PATH}"
+  stub_bazel
+
+  run_hook
+
+  assert_success
+  # The importing rc holds one line; the flags live in the rc it names.
+  assert_output --partial "Generated ${HOME}/.aspect/bazelrc:"
+  assert_output --partial "common:aspect-cloud --remote_cache=grpcs://cache.aspect.build"
+  # Header values carry credentials, so the echo redacts them.
+  assert_output --partial "--remote_header=x-aspect-token=<REDACTED>"
+  refute_output --partial "secret-token-value"
+}
+
+@test "authenticates on a Workflows runner too, before generating the rc" {
+  export ASPECT_WORKFLOWS_RUNNER=1
+  export ASPECT_API_TOKEN="client_id:secret"
+  cat > "${STUB_BIN}/aspect" <<EOF
+#!/bin/bash
+if [[ "\$1" == "auth" && "\$2" == "login" && "\$3" == "--with-api-token" ]]; then
+  cat > '${ASPECT_STUB_TOKEN}'
+  exit 0
+fi
+if [[ "\$1" == "setup" && "\$2" == "bazelrc" ]]; then
+  # Prove the login landed first: the rc records whether the token file exists.
+  [[ -f '${ASPECT_STUB_TOKEN}' ]] && echo 'common --remote_cache=grpcs://after-login' > "\${HOME}/.bazelrc"
+  exit 0
+fi
+exit 2
+EOF
+  chmod +x "${STUB_BIN}/aspect"
+  export PATH="${STUB_BIN}:${PATH}"
+
+  run_hook
+
+  assert_success
+  assert_output --partial "Persisted Aspect session JWT"
+  assert_output --partial "common --remote_cache=grpcs://after-login"
 }
 
 @test "prefers \`aspect setup bazelrc\` to generate ~/.bazelrc" {
@@ -170,7 +476,7 @@ EOF
 
   assert_success
   # The ci-command failure points users at the aspect-cli releases.
-  assert_output --partial "aspect-cli v2026.38.10 or newer"
+  assert_output --partial "aspect-cli v2026.38.30 or newer"
   assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
   # Then the rosetta fallback writes the system rc and echoes its contents.
   assert_output --partial "Wrote Workflows-tuned bazelrc to ${BAZELRC_OUT}"
@@ -279,7 +585,7 @@ EOF
   # Build is NOT failed: warming is done and `aspect <task>` steps still work.
   assert_success
   assert_output --partial "Could not configure vanilla"
-  assert_output --partial "v2026.38.10 or newer"
+  assert_output --partial "v2026.38.30 or newer"
   assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
   refute_output --partial "Wrote Workflows-tuned bazelrc"
 }

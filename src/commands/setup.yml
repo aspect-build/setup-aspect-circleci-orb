@@ -1,15 +1,98 @@
 description: >
-  Configure the Aspect Workflows runner for vanilla `bazel` calls: wait for cache
-  warming to complete and generate a Workflows-tuned Bazel rc (via
-  `aspect setup bazelrc`, with a legacy fallback for runners whose CLI
-  predates that task).
+  Configure the job for vanilla `bazel` calls. On a stock executor: install the
+  Aspect CLI launcher and Bazelisk (each skipped when already on PATH),
+  authenticate if ASPECT_API_TOKEN is set, and run `aspect setup bazelrc`, which
+  on CI writes ~/.aspect/bazelrc — try-imported from ~/.bazelrc — pointing Bazel
+  at the Aspect deployment's remote cache and BES. On an Aspect Workflows
+  runner: wait for cache warming to complete and write the runner's endpoints
+  into ~/.aspect/bazelrc
+  instead (the same task, with a legacy fallback for runners whose CLI predates
+  it).
 
   Add this as a step after `checkout` and before any step that calls `bazel`
-  directly. The rc generator reads the workspace's `.bazelversion`, so the repo
-  must already be checked out (CWD = the workspace root). On a non-Workflows
-  runner the command no-ops gracefully.
+  directly: the launcher resolves the repo's pinned CLI version from the
+  workspace, and the legacy generator reads its `.bazelversion` (CWD = the
+  workspace root).
+
+  Set ASPECT_API_TOKEN from a CircleCI context or project environment variable
+  so Bazel can authenticate to the cache the generated rc names. The command
+  writes the PATH additions to ${BASH_ENV}, so later steps in the job see
+  `aspect` and `bazel` too.
+
+parameters:
+  bazelrc-generate:
+    type: boolean
+    default: true
+    description: |
+      Whether to write ~/.aspect/bazelrc, and the `try-import` for it in
+      ~/.bazelrc, by running `aspect setup bazelrc`. On by default.
+
+      That rc is what makes a plain `bazel build //...` read and write a cache
+      shared across jobs and branches, and stream the build to Aspect, without
+      the pipeline configuring anything else. The deployment defaults to
+      Aspect Cloud; set ASPECT_API_TOKEN so Bazel can authenticate to it,
+      which is also what the task looks for before enabling those endpoints at
+      all.
+
+      Set to `false` if you configure Bazel yourself, or to keep this step
+      from touching ~/.bazelrc; the launcher and Bazelisk installs, the login,
+      and the warming wait on a Workflows runner all still happen, which is
+      what makes this different from dropping the step. `aspect <task>` steps
+      are unaffected either way, since a task configures its own Bazel
+      invocation.
+
+      On an Aspect Workflows runner the same two files hold that runner's own
+      services rather than a deployment's, and `false` skips them there too —
+      `aspect <task>` still reaches those services, a vanilla `bazel` call no
+      longer would.
+
+  bazelrc-remote:
+    type: string
+    default: ""
+    description: |
+      Which of the deployment's remote endpoints the generated
+      ~/.aspect/bazelrc turns on, passed to `aspect setup bazelrc` as
+      `--remote=<value>`. Unset by default, which leaves the CLI's own `auto`:
+      the remote cache and BES on CI, and nothing off it.
+
+      Same grammar as `aspect build --remote`. `exec` adds remote execution,
+      which is never automatic. `no-cache` / `no-bes` / `no-exec` subtract, so
+      `no-bes` is the cache alone. `none` enables nothing. `auto` is the
+      default spelled out.
+
+  bazelrc-home:
+    type: string
+    default: ""
+    description: |
+      Which rc `aspect setup bazelrc` writes, passed as `--home=<value>`.
+      Unset by default, which leaves the CLI's own `auto`: the machine's rc
+      under ~/.aspect on CI, and the checkout's off it.
+
+      `false` writes the checkout's <workspace>/.aspect/bazelrc and a
+      `try-import` into the repository's .bazelrc instead — files meant to be
+      committed, so this is for a job whose purpose is regenerating them.
+      `true` forces the machine's rc.
+
+  bazelrc-force:
+    type: boolean
+    default: false
+    description: |
+      Regenerate ~/.aspect/bazelrc even if one is already there, passing
+      `--force`. Off by default, because the CLI keeps an existing rc: the
+      checkout's is the repository's to edit, and the machine's may belong to
+      a executor someone set up by hand.
+
+      Worth turning on for a persistent self-hosted executor, whose home
+      directory survives between jobs and would otherwise keep the file
+      written by the first job on it. An ephemeral executor starts clean, so
+      this changes nothing there.
 
 steps:
   - run:
       name: "Setup Aspect"
+      environment:
+        ASPECT_SETUP_GENERATE: << parameters.bazelrc-generate >>
+        ASPECT_SETUP_REMOTE: << parameters.bazelrc-remote >>
+        ASPECT_SETUP_HOME: << parameters.bazelrc-home >>
+        ASPECT_SETUP_FORCE: << parameters.bazelrc-force >>
       command: <<include(scripts/setup.sh)>>
