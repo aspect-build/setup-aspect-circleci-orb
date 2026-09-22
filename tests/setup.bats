@@ -67,8 +67,13 @@ run_hook() {
 # next name rather than mistaking a no-op for success.
 stub_aspect() {
   local group="${1:-setup}"
+  local version="${2:-2026.38.34}"
   cat > "${STUB_BIN}/aspect" <<EOF
 #!/bin/bash
+if [[ "\$1" == "version" ]]; then
+  echo '${version}'
+  exit 0
+fi
 if [[ "\$1" == "${group}" && "\$2" == "bazelrc" ]]; then
   {
     echo 'common --remote_cache=grpcs://example'
@@ -476,7 +481,7 @@ EOF
 
   assert_success
   # The ci-command failure points users at the aspect-cli releases.
-  assert_output --partial "aspect-cli v2026.38.30 or newer"
+  assert_output --partial "aspect-cli v2026.38.34 or newer"
   assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
   # Then the rosetta fallback writes the system rc and echoes its contents.
   assert_output --partial "Wrote Workflows-tuned bazelrc to ${BAZELRC_OUT}"
@@ -585,7 +590,7 @@ EOF
   # Build is NOT failed: warming is done and `aspect <task>` steps still work.
   assert_success
   assert_output --partial "Could not configure vanilla"
-  assert_output --partial "v2026.38.30 or newer"
+  assert_output --partial "v2026.38.34 or newer"
   assert_output --partial "https://github.com/aspect-build/aspect-cli/releases"
   refute_output --partial "Wrote Workflows-tuned bazelrc"
 }
@@ -630,4 +635,46 @@ EOF
   # rosetta was never invoked past the guard; the existing system rc is untouched.
   run cat "${BAZELRC_OUT}"
   assert_output "build --pre-existing"
+}
+
+@test "warns when the Aspect CLI is older than the minimum this integration supports" {
+  export ASPECT_WORKFLOWS_RUNNER=1
+  stub_aspect setup 2026.38.30
+
+  run_hook
+
+  assert_success
+  assert_output --partial "Aspect CLI 2026.38.30 is older than v2026.38.34"
+  assert_output --partial "Upgrade to the latest release"
+}
+
+@test "does not warn when the Aspect CLI is at or above the minimum" {
+  export ASPECT_WORKFLOWS_RUNNER=1
+  stub_aspect setup 2026.38.34
+
+  run_hook
+
+  assert_success
+  refute_output --partial "is older than"
+}
+
+@test "compares versions as numbers, not as strings" {
+  # 2026.39.9 is newer than 2026.38.34 despite sorting before it as text.
+  export ASPECT_WORKFLOWS_RUNNER=1
+  stub_aspect setup 2026.39.9
+
+  run_hook
+
+  assert_success
+  refute_output --partial "is older than"
+}
+
+@test "says nothing about the version of a dev build" {
+  export ASPECT_WORKFLOWS_RUNNER=1
+  stub_aspect setup "0.0.0-dev (debug build)"
+
+  run_hook
+
+  assert_success
+  refute_output --partial "is older than"
 }

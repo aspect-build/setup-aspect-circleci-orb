@@ -48,9 +48,11 @@ set -euo pipefail
 # tests (writing the real path requires root, which a test environment lacks).
 SYSTEM_BAZELRC="${ASPECT_WORKFLOWS_PLUGIN_SYSTEM_BAZELRC:-/etc/bazel.bazelrc}"
 
-# The aspect-cli release that ships `aspect setup bazelrc`, and where to get it.
-# Named in the upgrade hint shown when the runner's CLI cannot write ~/.aspect/bazelrc.
-ASPECT_SETUP_BAZELRC_MIN_VERSION="v2026.38.30"
+# The oldest Aspect CLI this integration supports, as `aspect version` reports
+# it, and where to get a newer one. `check_cli_version` warns below it, and the
+# upgrade hints name it. It moves with the fixes a working setup depends on,
+# which is why it is well past the release that first shipped the rc task.
+ASPECT_CLI_MIN_VERSION="2026.38.34"
 ASPECT_CLI_RELEASES_URL="https://github.com/aspect-build/aspect-cli/releases"
 BAZELISK_RELEASES_URL="https://github.com/bazelbuild/bazelisk/releases"
 
@@ -154,6 +156,51 @@ wait_for_warming() {
     cache_version="$(tr -d '[:space:]' < "${version_file}")"
     [[ -n "${cache_version}" ]] && log "Runner warmed from cache version: ${cache_version}"
   fi
+}
+
+# The Aspect CLI's own version, as `YYYY.WW.N`, or "" when there is nothing to
+# compare.
+#
+# `aspect version` reports the CLI. `aspect --version` reports the *launcher*,
+# which is versioned separately and says nothing about the CLI a repository
+# pins, so it is the wrong question to ask here. Anything that is not a release
+# version — a dev build reports `0.0.0-dev (debug build)` — comes back empty
+# rather than being called old.
+aspect_cli_version() {
+  local reported
+  reported="$(aspect version 2>/dev/null | head -1 | tr -d '[:space:]')" || return 0
+  [[ "${reported}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+  printf '%s' "${reported}"
+}
+
+# Whether version $1 is at least $2, compared as numbers component by component:
+# 2026.38.34 is newer than 2026.38.9, which a string compare gets backwards.
+version_at_least() {
+  local -a have want
+  local i h w
+  IFS='.' read -r -a have <<< "$1"
+  IFS='.' read -r -a want <<< "$2"
+  for i in 0 1 2; do
+    h="${have[i]:-0}"
+    w="${want[i]:-0}"
+    if (( h > w )); then return 0; fi
+    if (( h < w )); then return 1; fi
+  done
+  return 0
+}
+
+# Warn when the CLI on this runner is older than this integration supports.
+#
+# Advisory, like every other diagnostic here: an older CLI still runs, and what
+# it gets wrong is not always visible in the job that runs it. Silent when the
+# version cannot be read, so a dev build or a CLI that cannot start is not
+# reported as out of date.
+check_cli_version() {
+  local version
+  version="$(aspect_cli_version)"
+  [[ -n "${version}" ]] || return 0
+  version_at_least "${version}" "${ASPECT_CLI_MIN_VERSION}" && return 0
+  warn "Aspect CLI ${version} is older than v${ASPECT_CLI_MIN_VERSION}, the minimum this integration supports. Upgrade to the latest release (${ASPECT_CLI_RELEASES_URL}); a repository pins the CLI it uses in .aspect/version.axl."
 }
 
 # Echo a generated rc file to the log so users can see exactly what was written
@@ -410,7 +457,7 @@ aspect_setup_bazelrc() {
   run_configured_bazelrc_task "Workflows-tuned" || status=$?
   [[ "${status}" -eq 0 ]] && return 0
 
-  warn "This Aspect CLI cannot run \`aspect setup bazelrc\`; it requires aspect-cli ${ASPECT_SETUP_BAZELRC_MIN_VERSION} or newer (${ASPECT_CLI_RELEASES_URL}). Trying the legacy generator instead."
+  warn "This Aspect CLI cannot run \`aspect setup bazelrc\`; upgrade to aspect-cli v${ASPECT_CLI_MIN_VERSION} or newer (${ASPECT_CLI_RELEASES_URL}). Trying the legacy generator instead."
   return "${status}"
 }
 # Legacy fallback generator, for runners whose CLI predates the bazelrc task.
@@ -466,7 +513,7 @@ write_bazelrc() {
     return 0
   fi
 
-  warn "Could not configure vanilla \`bazel\` calls on this Workflows runner: no bazelrc generator is available. Warming completed and \`aspect <task>\` steps are unaffected, but vanilla \`bazel\` calls will not pick up the runner's remote cache, repository cache, or disk cache and so will not function correctly. Upgrade aspect-cli to ${ASPECT_SETUP_BAZELRC_MIN_VERSION} or newer for \`aspect setup bazelrc\` (${ASPECT_CLI_RELEASES_URL})."
+  warn "Could not configure vanilla \`bazel\` calls on this Workflows runner: no bazelrc generator is available. Warming completed and \`aspect <task>\` steps are unaffected, but vanilla \`bazel\` calls will not pick up the runner's remote cache, repository cache, or disk cache and so will not function correctly. Upgrade aspect-cli to v${ASPECT_CLI_MIN_VERSION} or newer (${ASPECT_CLI_RELEASES_URL})."
   return 0
 }
 
@@ -533,6 +580,8 @@ setup_workflows_runner() {
 
   wait_for_warming
 
+  check_cli_version
+
   login_if_api_token
 
   if generating_bazelrc; then
@@ -550,6 +599,8 @@ setup_vanilla_runner() {
 
   ensure_aspect || return 0
   ensure_bazel || true
+
+  check_cli_version
 
   local login_status=0
   login_if_api_token || login_status=$?
